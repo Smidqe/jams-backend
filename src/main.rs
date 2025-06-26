@@ -1,5 +1,5 @@
-mod server;
 mod playlist;
+mod server;
 
 use std::{
     collections::HashMap,
@@ -23,14 +23,12 @@ use actix_web::{
 };
 use actix_ws::AggregatedMessage;
 use clap::Parser;
+use dirs::home_dir;
 use ffmpeg_next::{
-    codec::{Context, Parameters},
-    ffi::AVPixelFormat,
-    format::{input, Pixel},
-    frame::Video,
-    Stream,
+    codec::{Context, Parameters}, ffi::AVPixelFormat, format::{context::input::PacketIter, input, Pixel}, frame::Video, media, Packet, Stream, StreamMut
 };
 use futures::{future::ok, stream::once};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tokio_stream::StreamExt;
 use turbojpeg::{image::EncodableLayout, Subsamp, YuvImage};
 use walkdir::{DirEntry, WalkDir};
@@ -84,7 +82,7 @@ async fn song_tags() -> impl Responder {
 
 #[get("/artwork")]
 async fn artwork() -> impl Responder {
-	//return bytes from the appstate
+    //return bytes from the appstate
     HttpResponse::NoContent().finish()
 }
 
@@ -94,10 +92,33 @@ async fn manual_hello() -> impl Responder {
 
 #[derive(Default, Debug)]
 struct Song {
-	id: String,
+    id: String,
     title: String,
     artwork: Option<Vec<u8>>,
     meta: HashMap<String, String>,
+}
+
+#[derive(Default, Debug)]
+struct Song2 {
+    id: String,
+    path: PathBuf,
+
+    title: String,
+    artwork: Option<Vec<u8>>,
+    meta: HashMap<String, String>,
+}
+
+impl Song2 {
+    fn song_name(&self) -> &str {
+        if let Some(title) = self.meta.get("title") {
+            return title.as_str();
+        }
+
+        self.path
+            .file_name()
+            .map_or_else(|| Some("[unknown]"), |s| s.to_str())
+            .unwrap()
+    }
 }
 
 struct AppState {
@@ -150,9 +171,13 @@ struct Frame {
 }
 
 impl Default for Frame {
-	fn default() -> Self {
-		Self { video: Video::empty(), raw: Default::default(), format: Pixel::None }
-	}
+    fn default() -> Self {
+        Self {
+            video: Video::empty(),
+            raw: Default::default(),
+            format: Pixel::None,
+        }
+    }
 }
 
 fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
@@ -162,14 +187,13 @@ fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
         format = Pixel::from(transmute::<i32, AVPixelFormat>((*params.as_ptr()).format));
     }
 
-	let mut file = input(&path).expect("already exists");
-	let index = match file.streams().best(ffmpeg_next::media::Type::Video) {
-		Some(s) => s.index(),
-		None => return Frame::default()
-	};
+    let mut file = input(&path).expect("already exists");
+    let index = match file.streams().best(ffmpeg_next::media::Type::Video) {
+        Some(s) => s.index(),
+        None => return Frame::default(),
+    };
 
     let context_decoder = Context::from_parameters(params).expect("should be a valid stream");
-
     let mut decoder = context_decoder
         .decoder()
         .video()
@@ -179,10 +203,10 @@ fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
 
     for (_, packet) in file.packets().filter(|(s, _)| s.index() == index) {
         let _ = decoder.send_packet(&packet);
+		let _ = decoder.send_eof();
         let _ = decoder.receive_frame(&mut frame);
     }
 
-    let _ = decoder.send_eof();
     let mut data = Vec::new();
 
     //append data together,
@@ -211,17 +235,14 @@ fn extract_audio_title_and_tags<T: AsRef<Path>>(path: T) -> Song {
         Err(_) => return Song::default(),
     };
 
-    let video_stream = file.streams().best(ffmpeg_next::media::Type::Video);
-    let audio_stream = file.streams().best(ffmpeg_next::media::Type::Audio);
-
-    let mut art: Vec<u8> = Vec::new();
+    let mut art: Option<Vec<u8>> = None;
     let mut tags: HashMap<String, String> = HashMap::new();
 
-    if let Some(video) = video_stream {
-        art = extract_artwork(video, &path).unwrap_or_default()
+    if let Some(video) = file.streams().best(ffmpeg_next::media::Type::Video) {
+        art = extract_artwork(video, &path)
     }
 
-    if let Some(audio) = audio_stream {
+    if let Some(audio) = file.streams().best(ffmpeg_next::media::Type::Audio) {
         tags = extract_audio_track_tags(audio)
     }
 
@@ -230,14 +251,12 @@ fn extract_audio_title_and_tags<T: AsRef<Path>>(path: T) -> Song {
         .map_or("[unknown title]", |v| v)
         .to_string();
 
-	let hash = blake3::hash(
-		fs::read(path).expect("it's already there").as_slice()
-	);
+    let hash = blake3::hash(fs::read(path).expect("it's already there").as_slice());
 
     Song {
-		id: hash.to_string(),
+        id: hash.to_string(),
         meta: tags,
-        artwork: Some(art),
+        artwork: art,
         title,
     }
 }
@@ -262,19 +281,21 @@ fn is_frame_yuv(format: Pixel) -> bool {
     format!("{format:?}").starts_with("YUV")
 }
 
-fn create_yuv_image(frame: Frame, quality: i32) -> Vec<u8> {
+fn create_yuv_image<T: AsRef<Path>>(frame: Frame, quality: i32, path: T) -> Vec<u8> {
     let image = YuvImage {
-        align: 32,
+        align: 2,
         height: frame.video.height() as usize,
         width: frame.video.width() as usize,
         pixels: frame.raw.as_slice(),
         subsamp: get_subsampling(frame.format),
     };
 
-    let buf = turbojpeg::compress_yuv(image, quality).expect("compression failed");
-    let bytes = buf.as_bytes().to_vec();
+	//println!("Compressing image for {} and it has format of {:?}", path.as_ref().to_string_lossy(), frame.format);
 
-    bytes
+	match turbojpeg::compress_yuv(image, quality) {
+		Ok(buf) => buf.as_bytes().to_vec(),
+		Err(_) => Vec::default(),
+	}
 }
 
 fn create_rgb_image(_frame: Frame, _quality: i32) -> Vec<u8> {
@@ -284,7 +305,7 @@ fn create_rgb_image(_frame: Frame, _quality: i32) -> Vec<u8> {
 fn extract_artwork<T: AsRef<Path>>(stream: Stream, path: T) -> Option<Vec<u8>> {
     let frame = extract_first_frame(stream.parameters(), &path);
     let bytes = if is_frame_yuv(frame.format) {
-        create_yuv_image(frame, 90)
+        create_yuv_image(frame, 90, path)
     } else {
         create_rgb_image(frame, 90)
     };
@@ -299,40 +320,28 @@ struct Args {
     path: String,
 }
 
+fn is_hidden(entry: &DirEntry) -> bool {
+	entry
+		.file_name()
+		.to_str()
+		.map(|s| s.starts_with("."))
+		.unwrap_or(false)
+}
+
+
+fn discover2(path: &PathBuf) -> Vec<DirEntry> {
+	let walker = WalkDir::new(path).into_iter();
+	
+	Vec::from_iter(
+		walker.filter_entry(|e| !is_hidden(e)).flatten()
+	)
+}
+
 async fn discover(path: &PathBuf) -> Vec<Song> {
-    fn is_hidden(entry: &DirEntry) -> bool {
-        entry
-            .file_name()
-            .to_str()
-            .map(|s| s.starts_with("."))
-            .unwrap_or(false)
-    }
+	let files = discover2(path);
+	let songs = files.iter().map(|f| extract_audio_title_and_tags(f.path())).collect();
 
-    fn is_ogg(entry: &DirEntry) -> bool {
-        entry
-            .file_name()
-            .to_str()
-            .map(|s| s.ends_with("ogg"))
-            .unwrap_or(false)
-    }
-
-    let walker = WalkDir::new(path).into_iter();
-    let mut songs = Vec::new();
-
-    for entry in walker.filter_entry(|e| !is_hidden(e)) {
-        let file = match entry {
-            Ok(f) => f,
-            _ => continue,
-        };
-
-        if !is_ogg(&file) {
-            continue;
-        }
-
-        songs.push(extract_audio_title_and_tags(file.path()));
-    }
-
-    songs
+	songs
 }
 
 #[actix_web::main]
@@ -340,13 +349,20 @@ async fn main() -> std::io::Result<()> {
     ffmpeg_next::init().unwrap();
     //Steps:
     //1. Load all files within the specified folder
-    let path = current_dir()?;
+    let path = home_dir()
+        .expect("aaaa")
+        .join("mounts/nas/pony/pony/music");
     let songs = discover(&path).await;
+
+	println!("{}", songs.len());
+	println!("{}", songs.iter().filter(|s| s.artwork.as_ref().is_some()).count());
 
     //2. Start up the playlist
     //3. Start up WS handler
     //4. Start up the server
     let playlist: Vec<String> = Vec::new();
+
+    println!("Starting server");
 
     HttpServer::new(|| {
         App::new()
@@ -366,5 +382,3 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
-
-
