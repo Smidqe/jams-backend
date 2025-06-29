@@ -1,5 +1,4 @@
 mod playlist;
-mod server;
 
 use std::{
     collections::HashMap,
@@ -9,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{atomic::AtomicUsize, Arc, RwLock},
+    time::Duration,
 };
 
 use actix_web::{
@@ -25,7 +25,15 @@ use actix_ws::AggregatedMessage;
 use clap::Parser;
 use dirs::home_dir;
 use ffmpeg_next::{
-    codec::{Context, Parameters}, ffi::AVPixelFormat, format::{context::input::PacketIter, input, Pixel}, frame::Video, media, Packet, Stream, StreamMut
+    codec::{Context, Parameters},
+    ffi::AVPixelFormat,
+    format::{
+        context::{input::PacketIter, Input},
+        input, Pixel,
+    },
+    frame::Video,
+    media::{self, Type},
+    Packet, Stream, StreamMut,
 };
 use futures::{future::ok, stream::once};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -65,8 +73,7 @@ async fn echo(req_body: String) -> impl Responder {
 #[get("/stream")]
 async fn streamEndpoint() -> impl Responder {
     //TODO: This should take in the song ID and get the artwork from there
-    let home = current_dir();
-    let path = home.unwrap().join("songs/galacontheme.ogg");
+    let path = get_song_folder().join("Aurelleah - Luna's Future -Aurelleah Remix-.mp3");
     let file = fs::read(path).unwrap();
     let body = once(ok::<_, Error>(Bytes::from(file)));
 
@@ -82,7 +89,13 @@ async fn song_tags() -> impl Responder {
 
 #[get("/artwork")]
 async fn artwork() -> impl Responder {
+    let path = get_song_folder().join("Aurelleah - Luna's Future -Aurelleah Remix-.mp3");
+    let stuff = extract_audio_title_and_tags(path);
     //return bytes from the appstate
+    if let Some(artwork) = stuff.artwork {
+        return HttpResponse::Ok().body(artwork);
+    }
+
     HttpResponse::NoContent().finish()
 }
 
@@ -99,7 +112,7 @@ struct Song {
 }
 
 #[derive(Default, Debug)]
-struct Song2 {
+pub struct Song2 {
     id: String,
     path: PathBuf,
 
@@ -109,15 +122,36 @@ struct Song2 {
 }
 
 impl Song2 {
-    fn song_name(&self) -> &str {
+    pub fn name(&self) -> String {
         if let Some(title) = self.meta.get("title") {
-            return title.as_str();
+            title.to_string()
+        } else {
+            String::from("[unknown]")
         }
+    }
 
-        self.path
-            .file_name()
-            .map_or_else(|| Some("[unknown]"), |s| s.to_str())
-            .unwrap()
+    pub fn duration(&self) -> Duration {
+        if let Some(duration) = self.meta.get("duration") {
+            Duration::from_secs(duration.parse().unwrap_or(0))
+        } else {
+            Duration::from_secs(0)
+        }
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn has_artwork(&self) -> bool {
+        self.artwork.is_some()
+    }
+
+    pub fn get_artwork(&self) -> &[u8] {
+        if let Some(art) = &self.artwork {
+            art.as_slice()
+        } else {
+            &[]
+        }
     }
 }
 
@@ -180,18 +214,12 @@ impl Default for Frame {
     }
 }
 
-fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
+fn extract_first_frame(input: &mut Input, params: Parameters, index: usize) -> Frame {
     let format: Pixel;
 
     unsafe {
         format = Pixel::from(transmute::<i32, AVPixelFormat>((*params.as_ptr()).format));
     }
-
-    let mut file = input(&path).expect("already exists");
-    let index = match file.streams().best(ffmpeg_next::media::Type::Video) {
-        Some(s) => s.index(),
-        None => return Frame::default(),
-    };
 
     let context_decoder = Context::from_parameters(params).expect("should be a valid stream");
     let mut decoder = context_decoder
@@ -201,9 +229,9 @@ fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
 
     let mut frame = Video::empty();
 
-    for (_, packet) in file.packets().filter(|(s, _)| s.index() == index) {
+    for (_, packet) in input.packets().filter(|(s, _)| s.index() == index) {
         let _ = decoder.send_packet(&packet);
-		let _ = decoder.send_eof();
+        let _ = decoder.send_eof();
         let _ = decoder.receive_frame(&mut frame);
     }
 
@@ -221,7 +249,12 @@ fn extract_first_frame<T: AsRef<Path>>(params: Parameters, path: T) -> Frame {
     }
 }
 
-fn extract_audio_track_tags(stream: Stream) -> HashMap<String, String> {
+fn extract_audio_track_tags(input: &mut Input) -> HashMap<String, String> {
+    let stream = match input.streams().best(Type::Audio) {
+        Some(stream) => stream,
+        None => return HashMap::new(),
+    };
+
     stream
         .metadata()
         .iter()
@@ -230,21 +263,13 @@ fn extract_audio_track_tags(stream: Stream) -> HashMap<String, String> {
 }
 
 fn extract_audio_title_and_tags<T: AsRef<Path>>(path: T) -> Song {
-    let file = match input(&path) {
+    let mut file = match input(&path) {
         Ok(inp) => inp,
         Err(_) => return Song::default(),
     };
 
-    let mut art: Option<Vec<u8>> = None;
-    let mut tags: HashMap<String, String> = HashMap::new();
-
-    if let Some(video) = file.streams().best(ffmpeg_next::media::Type::Video) {
-        art = extract_artwork(video, &path)
-    }
-
-    if let Some(audio) = file.streams().best(ffmpeg_next::media::Type::Audio) {
-        tags = extract_audio_track_tags(audio)
-    }
+    let art: Option<Vec<u8>> = extract_artwork(&mut file);
+    let tags: HashMap<String, String> = extract_audio_track_tags(&mut file);
 
     let title = tags
         .get("title")
@@ -281,36 +306,40 @@ fn is_frame_yuv(format: Pixel) -> bool {
     format!("{format:?}").starts_with("YUV")
 }
 
-fn create_yuv_image<T: AsRef<Path>>(frame: Frame, quality: i32, path: T) -> Vec<u8> {
+fn create_yuv_image(frame: Frame, quality: i32) -> Vec<u8> {
     let image = YuvImage {
-        align: 2,
+        align: 64,
         height: frame.video.height() as usize,
         width: frame.video.width() as usize,
         pixels: frame.raw.as_slice(),
         subsamp: get_subsampling(frame.format),
     };
 
-	//println!("Compressing image for {} and it has format of {:?}", path.as_ref().to_string_lossy(), frame.format);
-
-	match turbojpeg::compress_yuv(image, quality) {
-		Ok(buf) => buf.as_bytes().to_vec(),
-		Err(_) => Vec::default(),
-	}
+    match turbojpeg::compress_yuv(image, quality) {
+        Ok(buf) => buf.as_bytes().to_vec(),
+        Err(_) => Vec::default(),
+    }
 }
 
 fn create_rgb_image(_frame: Frame, _quality: i32) -> Vec<u8> {
     Vec::new()
 }
 
-fn extract_artwork<T: AsRef<Path>>(stream: Stream, path: T) -> Option<Vec<u8>> {
-    let frame = extract_first_frame(stream.parameters(), &path);
-    let bytes = if is_frame_yuv(frame.format) {
-        create_yuv_image(frame, 90, path)
-    } else {
-        create_rgb_image(frame, 90)
-    };
+fn extract_artwork(input: &mut Input) -> Option<Vec<u8>> {
+    let stream = input.streams().best(Type::Video);
 
-    Some(bytes)
+    if let Some(stream) = stream {
+        let frame = extract_first_frame(input, stream.parameters(), stream.index());
+        let bytes = if is_frame_yuv(frame.format) {
+            create_yuv_image(frame, 90)
+        } else {
+            create_rgb_image(frame, 90)
+        };
+
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -321,27 +350,33 @@ struct Args {
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
-	entry
-		.file_name()
-		.to_str()
-		.map(|s| s.starts_with("."))
-		.unwrap_or(false)
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with("."))
+        .unwrap_or(false)
 }
 
-
 fn discover2(path: &PathBuf) -> Vec<DirEntry> {
-	let walker = WalkDir::new(path).into_iter();
-	
-	Vec::from_iter(
-		walker.filter_entry(|e| !is_hidden(e)).flatten()
-	)
+    let walker = WalkDir::new(path).into_iter();
+
+    Vec::from_iter(walker.filter_entry(|e| !is_hidden(e)).flatten())
 }
 
 async fn discover(path: &PathBuf) -> Vec<Song> {
-	let files = discover2(path);
-	let songs = files.iter().map(|f| extract_audio_title_and_tags(f.path())).collect();
+    let files = discover2(path);
+    let songs = files
+        .iter()
+        .map(|f| extract_audio_title_and_tags(f.path()))
+        .collect();
 
-	songs
+    songs
+}
+
+fn get_song_folder() -> PathBuf {
+    home_dir()
+        .expect("aaaa")
+        .join("projects/rust/jams-backend/songs")
 }
 
 #[actix_web::main]
@@ -349,13 +384,17 @@ async fn main() -> std::io::Result<()> {
     ffmpeg_next::init().unwrap();
     //Steps:
     //1. Load all files within the specified folder
-    let path = home_dir()
-        .expect("aaaa")
-        .join("mounts/nas/pony/pony/music");
+    let path = get_song_folder();
     let songs = discover(&path).await;
 
-	println!("{}", songs.len());
-	println!("{}", songs.iter().filter(|s| s.artwork.as_ref().is_some()).count());
+    println!("{}", songs.len());
+    println!(
+        "{}",
+        songs
+            .iter()
+            .filter(|s| s.artwork.as_ref().is_some())
+            .count()
+    );
 
     //2. Start up the playlist
     //3. Start up WS handler
