@@ -4,112 +4,65 @@ mod song;
 use std::{
     env::current_dir,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
+    sync::{atomic::AtomicBool, Arc},
 };
 
-use actix_web::{
-    get,
-    http::Error,
-    post, rt,
-    web::{self, Bytes},
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
+use axum::{
+    body::{Body, Bytes},
+    debug_handler,
+    extract::{
+        ws::{Message, Utf8Bytes, WebSocket},
+        State, WebSocketUpgrade,
+    },
+    http::StatusCode,
+    response::Response,
+    routing::{any, get},
+    Router,
 };
-use actix_ws::AggregatedMessage;
+
 use clap::Parser;
-use ffmpeg_next::format::input;
-use futures::{future::ok, stream::once, StreamExt};
+use futures::{stream::SplitSink, SinkExt, StreamExt};
 use parking_lot::RwLock;
+use serde::Serialize;
+use tokio::{spawn, sync::broadcast, try_join};
 
 use crate::{playlist::Playlist, song::Song};
 
-#[get("/version")]
-async fn version() -> impl Responder {
-    HttpResponse::NoContent()
-        .append_header(("x-jams-version", "0.1"))
-        .finish()
+#[debug_handler]
+async fn version() -> (StatusCode, String) {
+    (StatusCode::OK, String::from("0.1"))
 }
 
-#[post("/connect")]
-async fn connect() -> impl Responder {
-    HttpResponse::Ok().body("test")
+#[debug_handler]
+async fn song(State(state): State<Arc<AppState>>) -> Response {
+    let lock = state.song.read();
+
+    return Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from(lock.bytes.clone()))
+        .unwrap();
 }
 
-#[get("/stream")]
-async fn stream_endpoint(data: web::Data<AppState>) -> impl Responder {
-    let bytes = match data.current.read().as_ref() {
-        Some(s) => Bytes::from(s.get_song_bytes().to_vec()),
-        None => {
-            eprintln!("Nothing here :/");
-            Bytes::default()
-        }
-    };
+#[debug_handler]
+async fn artwork(State(state): State<Arc<AppState>>) -> Response {
+    let lock = state.song.read();
 
-    match bytes.len() {
-        0 => HttpResponse::InternalServerError().finish(),
-        _ => HttpResponse::Ok()
-            .content_type("audio/opus")
-            .streaming(once(ok::<_, Error>(bytes))),
-    }
+    return Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from(lock.artwork.clone()))
+        .unwrap();
 }
 
-#[get("/artwork")]
-async fn artwork(data: web::Data<AppState>) -> impl Responder {
-    let bytes = match data.current.read().as_ref() {
-        Some(s) => s.get_artwork().to_vec(),
-        None => Vec::default(),
-    };
-
-    if bytes.is_empty() {
-        HttpResponse::NoContent().finish()
-    } else {
-        HttpResponse::Ok().content_type("image/jpeg").body(bytes)
-    }
+#[derive(Debug, Default)]
+struct Songlet {
+    artwork: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
 struct AppState {
-    current: Arc<RwLock<Option<Song>>>,
-}
-
-async fn ws_echo(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
-    let (res, mut session, stream) = actix_ws::handle(&req, stream).unwrap();
-
-    let mut stream = stream
-        .aggregate_continuations()
-        // aggregate continuation frames up to 1MiB
-        .max_continuation_size(2_usize.pow(20));
-
-    // start task but don't wait for it
-    rt::spawn(async move {
-        // receive messages from websocket
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(AggregatedMessage::Text(text)) => {
-                    // echo text message
-                    session.text(text).await.unwrap();
-                }
-
-                Ok(AggregatedMessage::Binary(bin)) => {
-                    // echo binary message
-                    session.binary(bin).await.unwrap();
-                }
-
-                Ok(AggregatedMessage::Ping(msg)) => {
-                    // respond to PING frame with PONG frame
-                    session.pong(&msg).await.unwrap();
-                }
-
-                _ => {}
-            }
-        }
-    });
-
-    // respond immediately with response connected to WS session
-    Ok(res)
+    song: Arc<RwLock<Songlet>>,
+    tx: broadcast::Sender<Command>,
 }
 
 #[derive(Parser, Debug)]
@@ -119,51 +72,112 @@ struct Args {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum Command {
+    Shutdown,
+    Song { song: Song },
+    Playlist { items: Vec<Song> },
+}
+
+#[derive(Serialize)]
+pub enum EventKind {
+    Song,
+}
+
+#[derive(Serialize)]
+pub struct Event<T>
+where
+    T: Serialize,
+{
+    kind: EventKind,
+    payload: T,
+}
+
 fn get_song_folder() -> PathBuf {
     current_dir().expect("aaaa").join("songs")
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    ffmpeg_next::init().expect("eee");
-    //Steps:
-    //1. Load all files within the specified folder
+#[debug_handler]
+async fn ws_upgrader(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+    ws.on_upgrade(|s| ws_handler(s, state))
+}
 
-    //2. Start up the playlist thread
-    //3. Start up WS handler
-    //4. Start up the server
-
-    let shutdown = AtomicBool::new(false);
-    let current = Arc::new(RwLock::new(None));
-    let state = web::Data::new(AppState {
-        current: current.clone(),
+async fn serialize_and_send<T: Serialize>(payload: T, tx: &mut SplitSink<WebSocket, Message>) {
+    let ev = serde_json::to_string(&Event {
+        kind: EventKind::Song,
+        payload,
     });
 
-    //playlist thread
-    thread::spawn(move || {
-        let mut playlist = Playlist::from(get_song_folder());
+    if let Ok(s) = ev {
+        let _ = tx.send(Message::Text(Utf8Bytes::from(s))).await;
+    }
+}
 
-        *current.write() = playlist.current_cloned();
+async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
+    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+        return;
+    }
 
-        while !shutdown.load(Ordering::Relaxed) {
-            if playlist.tick() {
-                *current.write() = playlist.current_cloned();
+    let (mut tx, mut rx) = socket.split();
+    let mut listen = state.tx.subscribe();
+
+    let mut sending = spawn(async move {
+        loop {
+            match listen.recv().await {
+                Ok(Command::Shutdown) => break,
+                Ok(Command::Playlist { items }) => serialize_and_send(items, &mut tx).await,
+                Ok(Command::Song { song }) => serialize_and_send(song, &mut tx).await,
+                Err(e) => println!("err {}", e),
             }
-
-            thread::sleep(Duration::from_secs(1));
         }
     });
 
-    println!("Starting server");
+    //if socket errors, break
+    let mut receiving = spawn(async move {
+        loop {
+            match rx.next().await {
+                Some(Err(_)) => break,
+                Some(Ok(_)) | None => (),
+            }
+        }
+    });
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(state.clone())
-            .service(version)
-            .service(stream_endpoint)
-            .service(artwork)
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
+    tokio::select! {
+        _ = (&mut sending) => {
+            receiving.abort();
+        }
+        _ = (&mut receiving) => {
+            sending.abort();
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    ffmpeg_next::init().expect("eee");
+
+    let (tx, _rx) = broadcast::channel(1000);
+    let state = Arc::new(AppState {
+        song: Arc::new(RwLock::new(Songlet::default())),
+        tx,
+    });
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let playlist = spawn(Playlist::from(get_song_folder()).run(state.clone(), shutdown.clone()));
+
+    let app = Router::new()
+        .route("/version", get(version))
+        .route("/stream", get(song))
+        .route("/ws", any(ws_upgrader))
+        .route("/artwork", get(artwork))
+        .with_state(state);
+
+    axum::serve(
+        tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap(),
+        app,
+    )
     .await
+    .unwrap();
+
+    let _ = try_join!(playlist);
 }

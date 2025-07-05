@@ -1,10 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::Song;
+use crate::{AppState, Command, Song};
 
 pub struct Playlist {
     songs: Vec<Song>,
@@ -27,24 +35,11 @@ impl Playlist {
         self.songs.shuffle(&mut rand::rng());
     }
 
-    pub fn current_cloned(&self) -> Option<Song> {
-        self.songs.get(self.cursor).cloned()
-    }
-
     pub fn advance(&mut self) {
-        //offload current
-        if let Some(now) = self.songs.get_mut(self.cursor) {
-            now.offload();
-        }
-
         self.cursor += 1;
 
         if self.cursor >= self.songs.len() {
             self.cursor = 0;
-        }
-
-        if let Some(now) = self.songs.get_mut(self.cursor) {
-            now.load();
         }
 
         self.timestamp = 0;
@@ -63,6 +58,35 @@ impl Playlist {
         }
 
         advance
+    }
+
+    fn write_current_to_state(&self, state: Arc<AppState>) {
+        *state.song.write() = self.songs.get(self.cursor).unwrap().as_songlet();
+    }
+
+    fn write_song_to_socket(&self, state: Arc<AppState>) {
+        let song = self.songs.get(self.cursor).unwrap();
+        let _ = state.tx.send(Command::Song { song: song.clone() });
+    }
+
+    pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
+        self.write_current_to_state(state.clone());
+        self.write_song_to_socket(state.clone());
+
+        loop {
+            if self.tick() {
+                self.write_current_to_state(state.clone());
+                self.write_song_to_socket(state.clone());
+            }
+
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        Ok(())
     }
 }
 
