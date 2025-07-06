@@ -21,3 +21,4 @@ parking_lot = { version = "0.12.4", features = ["nightly"] }
 serde_json = "1.0.140"
 serde = { version = "1.0.219", features = ["derive"] }
 axum = { version = "0.8.4", features = ["ws", "macros"] }
+itertools = "0.14.0"

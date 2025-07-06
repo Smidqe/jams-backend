@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use itertools::Itertools;
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use walkdir::{DirEntry, WalkDir};
@@ -24,11 +25,21 @@ pub struct Playlist {
 
 impl Playlist {
     pub fn new(songs: Vec<Song>) -> Self {
-        Self {
+        let mut playlist = Self {
             songs,
             cursor: 0,
             timestamp: 0,
+        };
+
+        playlist.shuffle();
+
+        if let Some(song) = playlist.songs.get_mut(playlist.cursor) {
+            song.load();
+        } else {
+            println!("no song")
         }
+
+        playlist
     }
 
     pub fn shuffle(&mut self) {
@@ -36,22 +47,37 @@ impl Playlist {
     }
 
     pub fn advance(&mut self) {
+        println!("advance");
+        if let Some(song) = self.songs.get_mut(self.cursor) {
+            song.unload();
+        }
+
         self.cursor += 1;
 
         if self.cursor >= self.songs.len() {
             self.cursor = 0;
         }
 
+        if let Some(song) = self.songs.get_mut(self.cursor) {
+            song.load();
+        }
+
         self.timestamp = 0;
     }
 
     pub fn tick(&mut self) -> bool {
-        self.timestamp += 1000000;
+        self.timestamp += 1;
 
         let advance = match &self.songs.get(self.cursor) {
             None => false,
-            Some(s) => self.timestamp >= s.duration(),
+            Some(s) => s.duration().is_some_and(|d| self.timestamp >= *d),
         };
+
+        println!(
+            "now: {} s / song: {:?} s",
+            self.timestamp,
+            self.songs.get(self.cursor).unwrap().duration()
+        );
 
         if advance {
             self.advance();
@@ -61,7 +87,10 @@ impl Playlist {
     }
 
     fn write_current_to_state(&self, state: Arc<AppState>) {
-        *state.song.write() = self.songs.get(self.cursor).unwrap().as_songlet();
+        let song = self.songs.get(self.cursor).unwrap().clone();
+
+        *state.songlet.write() = song.as_songlet();
+        *state.song.write() = song;
     }
 
     fn write_song_to_socket(&self, state: Arc<AppState>) {
@@ -69,14 +98,69 @@ impl Playlist {
         let _ = state.tx.send(Command::Song { song: song.clone() });
     }
 
+    fn write_sync_to_socket(&self, state: Arc<AppState>) {
+        let _ = state.tx.send(Command::Sync {
+            ts: self.timestamp as u64,
+        });
+    }
+
+    fn preload_next(&mut self, count: usize) {
+        self.songs
+            .iter_mut()
+            .skip(self.cursor)
+            .take(count)
+            .for_each(|song| {
+                song.load();
+            });
+    }
+
+    fn write_playlist_to_state(&self, state: Arc<AppState>, size: usize, send: bool) {
+        let mut items: Vec<Song> = self
+            .songs
+            .iter()
+            .skip(self.cursor)
+            .take(size)
+            .cloned()
+            .collect();
+
+        //if we don't have enough towards the end, take from start
+        if self.songs.len() - self.cursor < size {
+            items.extend(self.songs.iter().take(size - items.len()).cloned());
+        }
+
+        items = items.into_iter().unique_by(|s| s.id().to_owned()).collect();
+
+        *state.playlist.write() = items.clone();
+
+        if send {
+            let _ = state.tx.send(Command::Playlist { items });
+        }
+    }
+
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
+        self.preload_next(10);
+
         self.write_current_to_state(state.clone());
-        self.write_song_to_socket(state.clone());
+        self.write_playlist_to_state(state.clone(), 10, false);
 
         loop {
+            state
+                .timestamp
+                .store(self.timestamp as u64, Ordering::SeqCst);
+
             if self.tick() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
                 self.write_current_to_state(state.clone());
                 self.write_song_to_socket(state.clone());
+
+                self.preload_next(10);
+                self.write_playlist_to_state(state.clone(), 10, true);
+            }
+
+            //handle sync
+            if self.timestamp > 0 && self.timestamp % 5 == 0 {
+                self.write_sync_to_socket(state.clone());
             }
 
             if shutdown.load(Ordering::Relaxed) {
