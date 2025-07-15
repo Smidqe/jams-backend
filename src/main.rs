@@ -16,9 +16,12 @@ use axum::{
     debug_handler,
     extract::{
         ws::{Message, Utf8Bytes, WebSocket},
-        State, WebSocketUpgrade,
+        Request, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{
+        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::Response,
     routing::{any, get},
     Router,
@@ -27,6 +30,7 @@ use axum::{
 use clap::Parser;
 use dirs::home_dir;
 use futures::{stream::SplitSink, SinkExt, StreamExt};
+use http_range_header::{EndPosition, StartPosition};
 use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::{spawn, sync::broadcast, try_join};
@@ -34,27 +38,77 @@ use tokio::{spawn, sync::broadcast, try_join};
 use crate::{playlist::Playlist, song::Song};
 
 #[debug_handler]
-async fn version() -> (StatusCode, String) {
-    (StatusCode::OK, String::from("0.1"))
+async fn version() -> Response {
+    Response::builder()
+        .header("x-jams-version", "0.1")
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn song_partial(headers: &HeaderMap, state: Arc<AppState>, size: usize) -> Response {
+    let lock = state.song2.read();
+    let range = parse_range_header(headers.get(RANGE).unwrap(), lock.len());
+    let (start, end) = match range {
+        (StartPosition::FromLast(start), EndPosition::LastByte) => ((start as usize), size),
+        (StartPosition::FromLast(start), EndPosition::Index(end)) => {
+            ((start as usize), (end as usize))
+        }
+        (StartPosition::Index(start), EndPosition::LastByte) => ((start as usize), size),
+        (StartPosition::Index(start), EndPosition::Index(end)) => {
+            ((start as usize), (end as usize))
+        }
+    };
+
+    let bytes = Bytes::copy_from_slice(&lock[start..end]);
+
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
+        .header(CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .unwrap()
 }
 
 #[debug_handler]
-async fn song(State(state): State<Arc<AppState>>) -> Response {
-    let lock = state.songlet.read();
+async fn song(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    println!("Song: HEAD: {:?}", headers);
+    println!("Request: {:?}", request);
 
-    return Response::builder()
-        .header("Content-Type", "application/octet-stream")
-        .body(Body::from(lock.bytes.clone()))
-        .unwrap();
+    let lock = state.song2.read();
+
+    if headers.contains_key(RANGE) {
+        return song_partial(&headers, state.clone(), lock.len());
+    }
+
+    Response::builder()
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_LENGTH, lock.len())
+        .body(Body::from(Bytes::copy_from_slice(&lock)))
+        .unwrap()
 }
 
-#[debug_handler]
-async fn artwork(State(state): State<Arc<AppState>>) -> Response {
-    let lock = state.songlet.read();
-    let body = if lock.artwork.len() > 0 {
-        Body::from(lock.artwork.clone())
+fn parse_range_header(header: &HeaderValue, max: usize) -> (StartPosition, EndPosition) {
+    if let Ok(value) = header.to_str() {
+        match http_range_header::parse_range_header(value) {
+            Ok(parsed) => (parsed.ranges[0].start, parsed.ranges[0].end),
+            Err(_) => (StartPosition::Index(0), EndPosition::Index(max as u64)),
+        }
     } else {
-        Body::from((*state.default_artwork).clone())
+        (StartPosition::Index(0), EndPosition::Index(max as u64))
+    }
+}
+
+#[debug_handler]
+async fn artwork(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    let lock = state.artwork2.read();
+    let body = match lock.len() {
+        0 => Body::from(get_default_artwork()),
+        _ => Body::from(state.artwork2.read().to_vec()),
     };
 
     return Response::builder()
@@ -63,20 +117,15 @@ async fn artwork(State(state): State<Arc<AppState>>) -> Response {
         .unwrap();
 }
 
-#[derive(Debug, Default)]
-pub struct Songlet {
-    artwork: Vec<u8>,
-    bytes: Vec<u8>,
-}
-
 #[derive(Debug, Clone)]
 struct AppState {
     song: Arc<RwLock<Song>>,
-    songlet: Arc<RwLock<Songlet>>,
     playlist: Arc<RwLock<Vec<Song>>>,
     timestamp: Arc<AtomicU64>,
     tx: broadcast::Sender<Command>,
 
+    song2: Arc<RwLock<Bytes>>,
+    artwork2: Arc<RwLock<Bytes>>,
     default_artwork: Arc<Vec<u8>>,
 }
 
@@ -209,11 +258,12 @@ async fn main() {
     let (tx, _rx) = broadcast::channel(1000);
     let state = Arc::new(AppState {
         song: Arc::new(RwLock::new(Song::default())),
-        songlet: Arc::new(RwLock::new(Songlet::default())),
         playlist: Arc::new(RwLock::new(Vec::default())),
         timestamp: Arc::new(AtomicU64::new(0)),
         tx,
 
+        song2: Arc::new(RwLock::new(Bytes::new())),
+        artwork2: Arc::new(RwLock::new(Bytes::new())),
         default_artwork: Arc::new(get_default_artwork()),
     });
 

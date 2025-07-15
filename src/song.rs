@@ -1,8 +1,12 @@
+use axum::body::Bytes;
 use ffmpeg_next::{format::input, media::Type, Rational};
 use serde::Serialize;
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use crate::Songlet;
+pub struct ShareableSong {
+    content: Bytes,
+    artwork: Bytes,
+}
 
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Song {
@@ -12,11 +16,11 @@ pub struct Song {
     path: PathBuf,
 
     #[serde(skip_serializing)]
-    bytes: Option<Vec<u8>>,
+    bytes: Vec<u8>,
     #[serde(skip_serializing)]
-    artwork: Option<Vec<u8>>,
+    artwork: Vec<u8>,
 
-    duration: Option<u128>,
+    duration: u128,
     tags: Option<HashMap<String, String>>,
 }
 
@@ -38,8 +42,8 @@ impl Song {
         }
     }
 
-    pub fn duration(&self) -> Option<&u128> {
-        self.duration.as_ref()
+    pub fn duration(&self) -> u128 {
+        self.duration
     }
 
     pub fn tags(&self) -> Option<&HashMap<String, String>> {
@@ -50,38 +54,39 @@ impl Song {
         &self.path
     }
 
-    pub fn as_songlet(&self) -> Songlet {
-        let artwork = match self.artwork.as_ref() {
-            Some(a) => a.clone(),
-            None => Vec::new(),
-        };
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 
-        Songlet {
-            artwork: artwork,
-            bytes: self.bytes.as_ref().unwrap().clone(),
-        }
+    pub fn artwork(&self) -> &[u8] {
+        &self.artwork
     }
 
     fn load_artwork(&mut self) {
-        if self.artwork.is_some() {
-            println!("Song {} already has artwork loaded", self.path().display());
+        if !self.artwork.is_empty() {
             return;
         }
+
+        //TODO: Large artworks fail on mobile side, so could try and shrink them by ourselves
+        // eg. /home/smidqe/mounts/nas/pony/music/albums/Pony Music Archive 21.03 (High Quality)/Artists/Likonan/WoodenToaster - Pinkie's Lie (Likonan Cover Instrumental).opus
+        // which has Stream #0:1: Video: png, rgba(pc, gbr/bt709/unknown), 6180x6180 [SAR 2835:2835 DAR 1:1], 90k tbr, 90k tbn (attached pic) :|
 
         let mut fd = input(&self.path).expect("failed to load artwork");
         let frame = fd
             .packets()
             .find(|(s, _)| s.parameters().medium() == Type::Video);
 
-        self.artwork = frame.and_then(|(_, p)| p.data().map(|s| s.to_vec()));
-
-        if self.artwork.is_none() || self.artwork.as_ref().is_some_and(|s| s.len() == 0) {
-            eprintln!("No artwork found for song at {}", self.path.display());
-        }
+        self.artwork = frame
+            .and_then(|(_, p)| p.data().map(|s| s.to_vec()))
+            .unwrap_or_default();
     }
 
     fn load_bytes(&mut self) {
-        self.bytes = fs::read(&self.path).ok();
+        if !self.bytes.is_empty() {
+            return;
+        }
+
+        self.bytes = fs::read(&self.path).unwrap_or_default();
     }
 
     fn calculate_duration(&mut self, duration: i64, time_base: Rational) -> u128 {
@@ -89,7 +94,7 @@ impl Song {
     }
 
     fn load_tags_and_duration(&mut self) {
-        if self.duration.is_some() {
+        if self.duration > 0 {
             return;
         }
 
@@ -101,15 +106,8 @@ impl Song {
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
 
-        println!(
-            "Duration of {}: {}, {}",
-            self.path.display(),
-            stream.duration(),
-            stream.time_base()
-        );
-
         self.tags = Some(tags);
-        self.duration = Some(self.calculate_duration(stream.duration(), stream.time_base()));
+        self.duration = self.calculate_duration(stream.duration(), stream.time_base());
     }
 
     pub fn load(&mut self) {
@@ -119,9 +117,8 @@ impl Song {
     }
 
     pub fn unload(&mut self) {
-        self.artwork = None;
-        self.bytes = None;
-        self.tags = None;
+        self.artwork.clear();
+        self.bytes.clear();
     }
 }
 
@@ -131,9 +128,9 @@ impl From<&walkdir::DirEntry> for Song {
             tags: None,
             id: blake3::hash(dir.path().to_string_lossy().as_bytes()).to_string(),
             path: dir.path().to_path_buf(),
-            duration: None,
-            bytes: None,
-            artwork: None,
+            duration: 0,
+            bytes: Vec::default(),
+            artwork: Vec::default(),
         }
     }
 }

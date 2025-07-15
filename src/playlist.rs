@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use itertools::Itertools;
+use axum::body::Bytes;
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use walkdir::{DirEntry, WalkDir};
@@ -70,7 +70,7 @@ impl Playlist {
 
         let advance = match &self.songs.get(self.cursor) {
             None => false,
-            Some(s) => s.duration().is_some_and(|d| self.timestamp >= *d),
+            Some(s) => self.timestamp >= s.duration(),
         };
 
         println!(
@@ -87,10 +87,12 @@ impl Playlist {
     }
 
     fn write_current_to_state(&self, state: Arc<AppState>) {
-        let song = self.songs.get(self.cursor).unwrap().clone();
-
-        *state.songlet.write() = song.as_songlet();
-        *state.song.write() = song;
+        if let Some(song) = self.songs.get(self.cursor) {
+            //TODO: This is expensive, keep serialized JSON in state insteads
+            *state.song.write() = song.clone();
+            *state.song2.write() = Bytes::copy_from_slice(song.bytes());
+            *state.artwork2.write() = Bytes::copy_from_slice(song.artwork());
+        }
     }
 
     fn write_song_to_socket(&self, state: Arc<AppState>) {
@@ -104,31 +106,37 @@ impl Playlist {
         });
     }
 
+    fn get_songs_wrapping(&self, count: usize) -> Vec<Song> {
+        self.songs
+            .iter()
+            .cycle()
+            .skip(self.cursor)
+            .take(count)
+            .cloned()
+            .collect()
+    }
+
     fn preload_next(&mut self, count: usize) {
+        let song_count = self.songs.len();
+
+        //load unless
         self.songs
             .iter_mut()
             .skip(self.cursor)
             .take(count)
-            .for_each(|song| {
-                song.load();
-            });
+            .for_each(|s| s.load());
+
+        if song_count - self.cursor < count {
+            self.songs
+                .iter_mut()
+                .take(song_count - self.cursor)
+                .for_each(|s| s.load());
+        }
     }
 
     fn write_playlist_to_state(&self, state: Arc<AppState>, size: usize, send: bool) {
-        let mut items: Vec<Song> = self
-            .songs
-            .iter()
-            .skip(self.cursor)
-            .take(size)
-            .cloned()
-            .collect();
-
-        //if we don't have enough towards the end, take from start
-        if self.songs.len() - self.cursor < size {
-            items.extend(self.songs.iter().take(size - items.len()).cloned());
-        }
-
-        items = items.into_iter().unique_by(|s| s.id().to_owned()).collect();
+        //BUG: When wrapping, the songs are not loaded
+        let items = self.get_songs_wrapping(size);
 
         *state.playlist.write() = items.clone();
 
@@ -167,6 +175,8 @@ impl Playlist {
                 break;
             }
 
+            //TODO: This has a drift, calculate spent time from start of loop to this point and use from_millis
+            //this is not generally a problem, but if there are much longer tracks then there's unnecessary jumping due to syncs
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
