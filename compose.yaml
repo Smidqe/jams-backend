@@ -1,0 +1,10 @@
+services:
+  jams:
+    build: .
+    environment:
+      - MAX_PLAYLIST_SIZE=10
+    ports:
+      - 8080:8080
+    volumes:
+      - ./artwork:/artwork
+      - ${DIR_PATH_SONGS}:/songs

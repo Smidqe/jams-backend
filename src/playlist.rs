@@ -8,12 +8,11 @@ use std::{
     time::Duration,
 };
 
-use axum::body::Bytes;
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{AppState, Command, Song};
+use crate::{AppState, Command, ShareableSong, Song};
 
 pub struct Playlist {
     songs: Vec<Song>,
@@ -42,42 +41,42 @@ impl Playlist {
         playlist
     }
 
+    pub fn get_at_cursor(&self) -> &Song {
+        self.songs
+            .get(self.cursor)
+            .expect("there's always one at cursor")
+    }
+
+    pub fn get_at_cursor_mut(&mut self) -> &mut Song {
+        self.songs
+            .get_mut(self.cursor)
+            .expect("there's always one at cursor")
+    }
+
     pub fn shuffle(&mut self) {
         self.songs.shuffle(&mut rand::rng());
     }
 
     pub fn advance(&mut self) {
-        println!("advance");
-        if let Some(song) = self.songs.get_mut(self.cursor) {
-            song.unload();
-        }
+        self.get_at_cursor_mut().unload_tags();
 
-        self.cursor += 1;
-
-        if self.cursor >= self.songs.len() {
+        //if we're at the end, just cycle back
+        if self.cursor == self.songs.len() - 1 {
             self.cursor = 0;
+        } else {
+            self.cursor += 1;
         }
 
-        if let Some(song) = self.songs.get_mut(self.cursor) {
-            song.load();
-        }
+        self.get_at_cursor_mut().load_tags_and_duration();
 
+        //reset timestamp
         self.timestamp = 0;
     }
 
     pub fn tick(&mut self) -> bool {
         self.timestamp += 1;
 
-        let advance = match &self.songs.get(self.cursor) {
-            None => false,
-            Some(s) => self.timestamp >= s.duration(),
-        };
-
-        println!(
-            "now: {} s / song: {:?} s",
-            self.timestamp,
-            self.songs.get(self.cursor).unwrap().duration()
-        );
+        let advance = self.timestamp >= self.get_at_cursor().duration();
 
         if advance {
             self.advance();
@@ -86,24 +85,20 @@ impl Playlist {
         advance
     }
 
-    fn write_current_to_state(&self, state: Arc<AppState>) {
-        if let Some(song) = self.songs.get(self.cursor) {
-            //TODO: This is expensive, keep serialized JSON in state insteads
-            *state.song.write() = song.clone();
-            *state.song2.write() = Bytes::copy_from_slice(song.bytes());
-            *state.artwork2.write() = Bytes::copy_from_slice(song.artwork());
-        }
-    }
+    fn write_to_state(&self, state: Arc<AppState>, size: usize) {
+        let song = self.get_at_cursor();
+        let playlist = self.get_songs_wrapping(size);
 
-    fn write_song_to_socket(&self, state: Arc<AppState>) {
-        let song = self.songs.get(self.cursor).unwrap();
+        *state.song.write() = song.clone();
+        *state.shared_song.write() = ShareableSong {
+            artwork: song.get_artwork_bytes(),
+            content: song.get_file_bytes(),
+        };
+
+        *state.playlist.write() = playlist.clone();
+
         let _ = state.tx.send(Command::Song { song: song.clone() });
-    }
-
-    fn write_sync_to_socket(&self, state: Arc<AppState>) {
-        let _ = state.tx.send(Command::Sync {
-            ts: self.timestamp as u64,
-        });
+        let _ = state.tx.send(Command::Playlist { items: playlist });
     }
 
     fn get_songs_wrapping(&self, count: usize) -> Vec<Song> {
@@ -134,22 +129,9 @@ impl Playlist {
         }
     }
 
-    fn write_playlist_to_state(&self, state: Arc<AppState>, size: usize, send: bool) {
-        //BUG: When wrapping, the songs are not loaded
-        let items = self.get_songs_wrapping(size);
-
-        *state.playlist.write() = items.clone();
-
-        if send {
-            let _ = state.tx.send(Command::Playlist { items });
-        }
-    }
-
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
-        self.preload_next(10);
-
-        self.write_current_to_state(state.clone());
-        self.write_playlist_to_state(state.clone(), 10, false);
+        self.preload_next(20);
+        self.write_to_state(state.clone(), 20);
 
         loop {
             state
@@ -157,18 +139,18 @@ impl Playlist {
                 .store(self.timestamp as u64, Ordering::SeqCst);
 
             if self.tick() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                //wait few seconds to account for sync drift
+                tokio::time::sleep(Duration::from_secs(3)).await;
 
-                self.write_current_to_state(state.clone());
-                self.write_song_to_socket(state.clone());
-
-                self.preload_next(10);
-                self.write_playlist_to_state(state.clone(), 10, true);
+                self.preload_next(20);
+                self.write_to_state(state.clone(), 20);
             }
 
             //handle sync
             if self.timestamp > 0 && self.timestamp % 5 == 0 {
-                self.write_sync_to_socket(state.clone());
+                let _ = state.tx.send(Command::Sync {
+                    ts: self.timestamp as u64,
+                });
             }
 
             if shutdown.load(Ordering::Relaxed) {
@@ -186,15 +168,12 @@ impl Playlist {
 
 impl From<&Path> for Playlist {
     fn from(path: &Path) -> Self {
-        let walker = WalkDir::new(path).into_iter();
+        let walker = WalkDir::new(path).follow_links(true).into_iter();
         let is_valid_entry = |e: &DirEntry| {
-            let is_traversal = e
-                .file_name()
+            !e.file_name()
                 .to_str()
                 .map(|s| s.starts_with("."))
-                .unwrap_or(false);
-
-            !is_traversal
+                .unwrap_or(false)
         };
 
         let entries: Vec<DirEntry> = walker

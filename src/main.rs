@@ -16,7 +16,7 @@ use axum::{
     debug_handler,
     extract::{
         ws::{Message, Utf8Bytes, WebSocket},
-        Request, State, WebSocketUpgrade,
+        State, WebSocketUpgrade,
     },
     http::{
         header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
@@ -28,7 +28,6 @@ use axum::{
 };
 
 use clap::Parser;
-use dirs::home_dir;
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use http_range_header::{EndPosition, StartPosition};
 use parking_lot::RwLock;
@@ -36,6 +35,12 @@ use serde::Serialize;
 use tokio::{spawn, sync::broadcast, try_join};
 
 use crate::{playlist::Playlist, song::Song};
+
+#[derive(Default, Debug)]
+pub struct ShareableSong {
+    pub content: Bytes,
+    pub artwork: Bytes,
+}
 
 #[debug_handler]
 async fn version() -> Response {
@@ -47,8 +52,8 @@ async fn version() -> Response {
 }
 
 fn song_partial(headers: &HeaderMap, state: Arc<AppState>, size: usize) -> Response {
-    let lock = state.song2.read();
-    let range = parse_range_header(headers.get(RANGE).unwrap(), lock.len());
+    let lock = state.shared_song.read();
+    let range = parse_range_header(headers.get(RANGE).unwrap(), lock.content.len());
     let (start, end) = match range {
         (StartPosition::FromLast(start), EndPosition::LastByte) => ((start as usize), size),
         (StartPosition::FromLast(start), EndPosition::Index(end)) => {
@@ -60,7 +65,7 @@ fn song_partial(headers: &HeaderMap, state: Arc<AppState>, size: usize) -> Respo
         }
     };
 
-    let bytes = Bytes::copy_from_slice(&lock[start..end]);
+    let bytes = Bytes::copy_from_slice(&lock.content[start..end]);
 
     Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
@@ -71,24 +76,17 @@ fn song_partial(headers: &HeaderMap, state: Arc<AppState>, size: usize) -> Respo
 }
 
 #[debug_handler]
-async fn song(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    request: Request,
-) -> Response {
-    println!("Song: HEAD: {:?}", headers);
-    println!("Request: {:?}", request);
-
-    let lock = state.song2.read();
+async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    let lock = state.shared_song.read();
 
     if headers.contains_key(RANGE) {
-        return song_partial(&headers, state.clone(), lock.len());
+        return song_partial(&headers, state.clone(), lock.content.len());
     }
 
     Response::builder()
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONTENT_LENGTH, lock.len())
-        .body(Body::from(Bytes::copy_from_slice(&lock)))
+        .header(CONTENT_LENGTH, lock.content.len())
+        .body(Body::from(Bytes::copy_from_slice(&lock.content)))
         .unwrap()
 }
 
@@ -104,11 +102,11 @@ fn parse_range_header(header: &HeaderValue, max: usize) -> (StartPosition, EndPo
 }
 
 #[debug_handler]
-async fn artwork(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let lock = state.artwork2.read();
-    let body = match lock.len() {
-        0 => Body::from(get_default_artwork()),
-        _ => Body::from(state.artwork2.read().to_vec()),
+async fn artwork(State(state): State<Arc<AppState>>) -> Response {
+    let lock = state.shared_song.read();
+    let body = match lock.artwork.len() {
+        0 => Body::from(state.default_artwork.to_vec()),
+        _ => Body::from(lock.artwork.to_vec()),
     };
 
     return Response::builder()
@@ -124,9 +122,8 @@ struct AppState {
     timestamp: Arc<AtomicU64>,
     tx: broadcast::Sender<Command>,
 
-    song2: Arc<RwLock<Bytes>>,
-    artwork2: Arc<RwLock<Bytes>>,
     default_artwork: Arc<Vec<u8>>,
+    shared_song: Arc<RwLock<ShareableSong>>,
 }
 
 #[derive(Parser, Debug)]
@@ -161,9 +158,7 @@ where
 }
 
 fn get_song_folder() -> PathBuf {
-    home_dir()
-        .expect("aaaa")
-        .join("mounts/nas/pony/music/albums/Pony Music Archive 21.03 (High Quality)")
+    current_dir().expect("how did this fail?").join("songs")
 }
 
 #[debug_handler]
@@ -226,7 +221,6 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     //if socket errors, break
     let mut receiving = spawn(async move {
         loop {
-            println!("received message");
             match rx.next().await {
                 Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
                 Some(Ok(_)) | None => (),
@@ -262,9 +256,8 @@ async fn main() {
         timestamp: Arc::new(AtomicU64::new(0)),
         tx,
 
-        song2: Arc::new(RwLock::new(Bytes::new())),
-        artwork2: Arc::new(RwLock::new(Bytes::new())),
         default_artwork: Arc::new(get_default_artwork()),
+        shared_song: Arc::new(RwLock::new(ShareableSong::default())),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
