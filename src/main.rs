@@ -3,12 +3,13 @@ mod song;
 
 use std::{
     env::current_dir,
-    fs,
+    fs, io,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use axum::{
@@ -139,6 +140,7 @@ pub enum Command {
     Song { song: Song },
     Playlist { items: Vec<Song> },
     Sync { ts: u64 },
+    Ping,
 }
 
 #[derive(Serialize)]
@@ -213,6 +215,9 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
                     serialize_and_send(EventKind::Song, song, &mut tx).await
                 }
                 Ok(Command::Sync { ts }) => serialize_and_send(EventKind::Sync, ts, &mut tx).await,
+                Ok(Command::Ping) => {
+                    let _ = tx.send(Message::Ping(Bytes::new())).await;
+                }
                 Err(e) => println!("err {}", e),
             }
         }
@@ -222,8 +227,19 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let mut receiving = spawn(async move {
         loop {
             match rx.next().await {
-                Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
-                Some(Ok(_)) | None => (),
+                Some(Ok(Message::Close(_))) => {
+                    println!("[ws]: Received a normal close");
+                    break;
+                }
+                Some(Err(e)) => {
+                    println!("[ws]: Connection ended with an error {}", e);
+                    break;
+                }
+                Some(Ok(m)) => match m {
+                    Message::Pong(_) => (),
+                    _ => println!("[ws]: Got a message of {:?}", m),
+                },
+                None => (),
             }
         }
     });
@@ -245,6 +261,22 @@ fn get_default_artwork() -> Vec<u8> {
     fs::read(path).unwrap().to_vec()
 }
 
+async fn ping_all_users_at_interval(
+    state: Arc<AppState>,
+    interval: usize,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        let _ = state.tx.send(Command::Ping);
+
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(interval as u64)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     ffmpeg_next::init().expect("eee");
@@ -262,6 +294,11 @@ async fn main() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let playlist = spawn(Playlist::from(get_song_folder()).run(state.clone(), shutdown.clone()));
+    let pinger = spawn(ping_all_users_at_interval(
+        state.clone(),
+        30,
+        shutdown.clone(),
+    ));
 
     let app = Router::new()
         .route("/version", get(version))
@@ -277,5 +314,5 @@ async fn main() {
     .await
     .unwrap();
 
-    let _ = try_join!(playlist);
+    let _ = try_join!(playlist, pinger);
 }
