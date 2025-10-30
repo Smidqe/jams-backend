@@ -1,144 +1,161 @@
+mod error;
 mod playlist;
 mod song;
 
 use std::{
-    env::current_dir,
-    fs, io,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
+    fs,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use axum::{
+    Router,
     body::{Body, Bytes},
     debug_handler,
     extract::{
+        Query, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
-        State, WebSocketUpgrade,
     },
     http::{
-        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, StatusCode,
+        header::{self, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE, RANGE},
     },
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{any, get},
-    Router,
 };
 
 use clap::Parser;
-use futures::{stream::SplitSink, SinkExt, StreamExt};
-use http_range_header::{EndPosition, StartPosition};
+use futures::{SinkExt, StreamExt, stream::SplitSink};
+use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange};
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{spawn, sync::broadcast, try_join};
 
 use crate::{playlist::Playlist, song::Song};
 
-#[derive(Default, Debug)]
-pub struct ShareableSong {
-    pub content: Bytes,
-    pub artwork: Bytes,
+pub struct RequestedRange {
+    pub start: usize,
+    pub end: usize,
 }
 
 #[debug_handler]
 async fn version() -> Response {
-    Response::builder()
-        .header("x-jams-version", "0.1")
-        .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .unwrap()
+    (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")]).into_response()
 }
 
-fn song_partial(headers: &HeaderMap, state: Arc<AppState>, size: usize) -> Response {
-    let lock = state.shared_song.read();
-    let range = parse_range_header(headers.get(RANGE).unwrap(), lock.content.len());
-    let (start, end) = match range {
-        (StartPosition::FromLast(start), EndPosition::LastByte) => ((start as usize), size),
-        (StartPosition::FromLast(start), EndPosition::Index(end)) => {
-            ((start as usize), (end as usize))
-        }
-        (StartPosition::Index(start), EndPosition::LastByte) => ((start as usize), size),
-        (StartPosition::Index(start), EndPosition::Index(end)) => {
-            ((start as usize), (end as usize))
-        }
+fn get_numerical_range_from_range(range: &SyntacticallyCorrectRange, max: u64) -> Range<usize> {
+    let (start, end) = match (range.start, range.end) {
+        //-xxx
+        (StartPosition::FromLast(start), EndPosition::LastByte) => (max - start, max),
+        //xxx-
+        (StartPosition::Index(start), EndPosition::LastByte) => (start, max),
+        //xxx-yyy
+        (StartPosition::Index(start), EndPosition::Index(end)) => (start, end),
+        //there's theoretical FromLast, Index range, but that doesn't make any sense
+        _ => unreachable!(),
     };
 
-    let bytes = Bytes::copy_from_slice(&lock.content[start..end]);
+    (start as usize)..(end as usize)
+}
 
-    Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
-        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, size))
-        .header(CONTENT_LENGTH, bytes.len())
-        .body(Body::from(bytes))
-        .unwrap()
+fn get_range_from_header(headers: &HeaderMap, size: u64) -> Range<usize> {
+    let header = headers.get(RANGE).expect("range check missing");
+    let presentation = header.to_str().expect("range header should be well formed");
+
+    match http_range_header::parse_range_header(presentation) {
+        //TODO: Support multipart ranges
+        Ok(r) => get_numerical_range_from_range(&r.ranges[0], size),
+        Err(_) => 0..0,
+    }
+}
+
+async fn authenticate_session(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    //ensure we have a proper header
+    //ensure we have
+
+    Response::default()
+}
+
+fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
+    let length = bytes.len() as u64;
+    let parsed_range = get_range_from_header(&headers, length);
+    let content_range = format!(
+        "bytes {}-{}/{}",
+        parsed_range.start, parsed_range.end, length
+    );
+
+    (
+        StatusCode::PARTIAL_CONTENT,
+        [
+            (header::CONTENT_RANGE, content_range),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from(bytes.slice(parsed_range)),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct AAA {
+    id: String,
 }
 
 #[debug_handler]
-async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let lock = state.shared_song.read();
+async fn song(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    query: Query<AAA>,
+) -> Response {
+    if !query.id.eq_ignore_ascii_case(state.song.read().id()) {
+        return (StatusCode::NOT_FOUND).into_response();
+    }
+
+    let bytes = state.song.read().bytes();
 
     if headers.contains_key(RANGE) {
-        return song_partial(&headers, state.clone(), lock.content.len());
+        return song_partial(bytes, headers);
     }
 
-    Response::builder()
-        .header(ACCEPT_RANGES, "bytes")
-        .header(CONTENT_LENGTH, lock.content.len())
-        .body(Body::from(Bytes::copy_from_slice(&lock.content)))
-        .unwrap()
-}
-
-fn parse_range_header(header: &HeaderValue, max: usize) -> (StartPosition, EndPosition) {
-    if let Ok(value) = header.to_str() {
-        match http_range_header::parse_range_header(value) {
-            Ok(parsed) => (parsed.ranges[0].start, parsed.ranges[0].end),
-            Err(_) => (StartPosition::Index(0), EndPosition::Index(max as u64)),
-        }
-    } else {
-        (StartPosition::Index(0), EndPosition::Index(max as u64))
-    }
+    (
+        StatusCode::OK,
+        [
+            (ACCEPT_RANGES, "bytes"),
+            (CONTENT_LENGTH, &bytes.len().to_string()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response()
 }
 
 #[debug_handler]
 async fn artwork(State(state): State<Arc<AppState>>) -> Response {
-    let lock = state.shared_song.read();
-    let body = match lock.artwork.len() {
-        0 => Body::from(state.default_artwork.to_vec()),
-        _ => Body::from(lock.artwork.to_vec()),
+    let bytes = state.song.read().coverart();
+    let body = if bytes.is_empty() {
+        Body::from(Bytes::copy_from_slice(&state.default_artwork))
+    } else {
+        Body::from(bytes)
     };
 
-    return Response::builder()
-        .header("Content-Type", "application/octet-stream")
-        .body(body)
-        .unwrap();
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/octet-stream")],
+        body,
+    )
+        .into_response()
 }
 
 #[derive(Debug, Clone)]
 struct AppState {
     song: Arc<RwLock<Song>>,
-    playlist: Arc<RwLock<Vec<Song>>>,
-    timestamp: Arc<AtomicU64>,
     tx: broadcast::Sender<Command>,
-
-    default_artwork: Arc<Vec<u8>>,
-    shared_song: Arc<RwLock<ShareableSong>>,
-}
-
-#[derive(Parser, Debug)]
-#[command(version)]
-struct Args {
-    #[arg(short, long)]
-    path: String,
+    default_artwork: Arc<Bytes>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Command {
     Shutdown,
     Song { song: Song },
-    Playlist { items: Vec<Song> },
     Sync { ts: u64 },
     Ping,
 }
@@ -157,10 +174,6 @@ where
 {
     kind: EventKind,
     payload: T,
-}
-
-fn get_song_folder() -> PathBuf {
-    current_dir().expect("how did this fail?").join("songs")
 }
 
 #[debug_handler]
@@ -188,29 +201,10 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let (mut tx, mut rx) = socket.split();
     let mut listen = state.tx.subscribe();
 
-    let song = state.song.read().clone();
-
-    //send song
-    let _ = serialize_and_send(EventKind::Song, song, &mut tx).await;
-
-    //send sync
-    let _ = serialize_and_send(
-        EventKind::Sync,
-        state.timestamp.load(Ordering::Relaxed),
-        &mut tx,
-    )
-    .await;
-
-    let pl = state.playlist.read().clone();
-    let _ = serialize_and_send(EventKind::Playlist, pl, &mut tx).await;
-
     let mut sending = spawn(async move {
         loop {
             match listen.recv().await {
                 Ok(Command::Shutdown) => break,
-                Ok(Command::Playlist { items }) => {
-                    serialize_and_send(EventKind::Playlist, items, &mut tx).await
-                }
                 Ok(Command::Song { song }) => {
                     serialize_and_send(EventKind::Song, song, &mut tx).await
                 }
@@ -254,51 +248,37 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-fn get_default_artwork() -> Vec<u8> {
-    let current = current_dir().expect("failed to get current dir");
-    let path = current.join("artwork/default.jpg");
-
-    fs::read(path).unwrap().to_vec()
+fn get_default_artwork(path: &Path) -> Bytes {
+    Bytes::from(fs::read(path).expect("can't function without default artwork"))
 }
 
-async fn ping_all_users_at_interval(
-    state: Arc<AppState>,
-    interval: usize,
-    shutdown: Arc<AtomicBool>,
-) {
-    loop {
-        let _ = state.tx.send(Command::Ping);
-
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_secs(interval as u64)).await;
-    }
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    artwork: String,
+    #[arg(short, long)]
+    source: String,
 }
 
 #[tokio::main]
 async fn main() {
     ffmpeg_next::init().expect("eee");
 
+    let args = Args::parse();
+
+    let source = PathBuf::try_from(args.source.as_str()).expect("source folder does not exist");
+    let artwork_path = PathBuf::try_from(args.artwork.as_str()).expect("artwork does not exist");
+
     let (tx, _rx) = broadcast::channel(1000);
     let state = Arc::new(AppState {
         song: Arc::new(RwLock::new(Song::default())),
-        playlist: Arc::new(RwLock::new(Vec::default())),
-        timestamp: Arc::new(AtomicU64::new(0)),
         tx,
 
-        default_artwork: Arc::new(get_default_artwork()),
-        shared_song: Arc::new(RwLock::new(ShareableSong::default())),
+        default_artwork: Arc::new(get_default_artwork(artwork_path.as_path())),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let playlist = spawn(Playlist::from(get_song_folder()).run(state.clone(), shutdown.clone()));
-    let pinger = spawn(ping_all_users_at_interval(
-        state.clone(),
-        30,
-        shutdown.clone(),
-    ));
+    let playlist = spawn(Playlist::from(source.as_path()).run(state.clone(), shutdown.clone()));
 
     let app = Router::new()
         .route("/version", get(version))
@@ -314,5 +294,5 @@ async fn main() {
     .await
     .unwrap();
 
-    let _ = try_join!(playlist, pinger);
+    let _ = try_join!(playlist);
 }

@@ -2,23 +2,28 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use serde::Serialize;
+use tokio::time::Instant;
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{AppState, Command, ShareableSong, Song};
+use crate::{AppState, Command, Song, song::AudioFormat};
 
+#[derive(Clone, Serialize)]
 pub struct Playlist {
     songs: Vec<Song>,
+    #[serde(skip_serializing)]
     // timestamp in ms
-    timestamp: u128,
+    timestamp: i64,
     // current
+    #[serde(skip_serializing)]
     cursor: usize,
 }
 
@@ -31,34 +36,27 @@ impl Playlist {
         };
 
         playlist.shuffle();
-
-        if let Some(song) = playlist.songs.get_mut(playlist.cursor) {
-            song.load();
-        } else {
-            println!("no song")
-        }
-
         playlist
     }
 
-    pub fn get_at_cursor(&self) -> &Song {
+    fn get_at_cursor(&self) -> &Song {
         self.songs
             .get(self.cursor)
             .expect("there's always one at cursor")
     }
 
-    pub fn get_at_cursor_mut(&mut self) -> &mut Song {
+    fn get_at_cursor_mut(&mut self) -> &mut Song {
         self.songs
             .get_mut(self.cursor)
             .expect("there's always one at cursor")
     }
 
-    pub fn shuffle(&mut self) {
+    fn shuffle(&mut self) {
         self.songs.shuffle(&mut rand::rng());
     }
 
-    pub fn advance(&mut self) {
-        self.get_at_cursor_mut().unload_tags();
+    fn load_next(&mut self, state: Arc<AppState>) {
+        self.get_at_cursor_mut().unload();
 
         //if we're at the end, just cycle back
         if self.cursor == self.songs.len() - 1 {
@@ -67,87 +65,28 @@ impl Playlist {
             self.cursor += 1;
         }
 
-        self.get_at_cursor_mut().load_tags_and_duration();
-
-        //reset timestamp
+        self.get_at_cursor_mut().load();
         self.timestamp = 0;
-    }
 
-    pub fn tick(&mut self) -> bool {
-        self.timestamp += 1;
-
-        let advance = self.timestamp >= self.get_at_cursor().duration();
-
-        if advance {
-            self.advance();
-        }
-
-        advance
-    }
-
-    fn write_to_state(&self, state: Arc<AppState>, size: usize) {
-        let song = self.get_at_cursor();
-        let playlist = self.get_songs_wrapping(size);
-
-        *state.song.write() = song.clone();
-        *state.shared_song.write() = ShareableSong {
-            artwork: song.get_artwork_bytes(),
-            content: song.get_file_bytes(),
-        };
-
-        *state.playlist.write() = playlist.clone();
-
-        let _ = state.tx.send(Command::Song { song: song.clone() });
-        let _ = state.tx.send(Command::Playlist { items: playlist });
-    }
-
-    fn get_songs_wrapping(&self, count: usize) -> Vec<Song> {
-        self.songs
-            .iter()
-            .cycle()
-            .skip(self.cursor)
-            .take(count)
-            .cloned()
-            .collect()
-    }
-
-    fn preload_next(&mut self, count: usize) {
-        let song_count = self.songs.len();
-
-        //load unless
-        self.songs
-            .iter_mut()
-            .skip(self.cursor)
-            .take(count)
-            .for_each(|s| s.load());
-
-        if song_count - self.cursor < count {
-            self.songs
-                .iter_mut()
-                .take(song_count - self.cursor)
-                .for_each(|s| s.load());
-        }
+        let _ = state.tx.send(Command::Song {
+            song: self.get_at_cursor().clone(),
+        });
     }
 
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
-        self.preload_next(20);
-        self.write_to_state(state.clone(), 20);
+        self.get_at_cursor_mut().load();
 
         loop {
-            state
-                .timestamp
-                .store(self.timestamp as u64, Ordering::SeqCst);
+            let start = Instant::now();
 
-            if self.tick() {
-                //wait few seconds to account for sync drift
-                tokio::time::sleep(Duration::from_secs(3)).await;
+            self.timestamp += 1;
 
-                self.preload_next(20);
-                self.write_to_state(state.clone(), 20);
+            if self.timestamp >= self.get_at_cursor().duration() {
+                self.load_next(state.clone())
             }
 
             //handle sync
-            if self.timestamp > 0 && self.timestamp % 5 == 0 {
+            if self.timestamp > 0 && self.timestamp % 10 == 0 {
                 let _ = state.tx.send(Command::Sync {
                     ts: self.timestamp as u64,
                 });
@@ -157,9 +96,13 @@ impl Playlist {
                 break;
             }
 
-            //TODO: This has a drift, calculate spent time from start of loop to this point and use from_millis
-            //this is not generally a problem, but if there are much longer tracks then there's unnecessary jumping due to syncs
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            //loop usually runs in few microseconds, but in case it does we attempt to adjust for that
+            let diff = 1000u128.saturating_sub(start.elapsed().as_millis());
+
+            //and sleep the difference
+            if diff > 0 {
+                tokio::time::sleep(Duration::from_millis(diff as u64)).await;
+            }
         }
 
         Ok(())
@@ -168,21 +111,35 @@ impl Playlist {
 
 impl From<&Path> for Playlist {
     fn from(path: &Path) -> Self {
-        let walker = WalkDir::new(path).follow_links(true).into_iter();
-        let is_valid_entry = |e: &DirEntry| {
-            !e.file_name()
-                .to_str()
-                .map(|s| s.starts_with("."))
-                .unwrap_or(false)
-        };
-
-        let entries: Vec<DirEntry> = walker
-            .filter_entry(is_valid_entry)
-            .flatten()
-            .filter(|e| e.file_type().is_file())
+        let entries: Vec<DirEntry> = WalkDir::new(path)
+            .into_iter()
+            .filter_map(|entry| {
+                if let Ok(e) = entry
+                    && AudioFormat::from(e.path()) != AudioFormat::FMT_AUDIO_UNKNOWN
+                {
+                    Some(e)
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        Self::new(entries.par_iter().map(Song::from).collect())
+        if entries.len() == 0 {
+            panic!("no songs at given path");
+        }
+
+        Self::new(
+            entries
+                .par_iter()
+                .filter_map(|s| Song::try_from(s).ok())
+                .collect(),
+        )
+    }
+}
+
+impl From<&str> for Playlist {
+    fn from(value: &str) -> Self {
+        Self::from(PathBuf::from(value))
     }
 }
 

@@ -1,97 +1,139 @@
 use axum::body::Bytes;
-use ffmpeg_next::{format::input, media::Type, Rational};
+use ffmpeg_next::{format::input, media::Type};
 use serde::Serialize;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
-#[derive(Default, Debug, Clone, Serialize)]
+#[allow(non_camel_case_types)]
+#[derive(Debug, PartialEq)]
+pub enum AudioFormat {
+    FMT_AUDIO_UNKNOWN,
+    FMT_AUDIO_3GP,
+    FMT_AUDIO_AA,
+    FMT_AUDIO_AAC,
+    FMT_AUDIO_AAX,
+    FMT_AUDIO_ACT,
+
+    FMT_AUDIO_OGG,
+    FMT_AUDIO_MP3,
+    FMT_AUDIO_OPUS,
+}
+
+impl From<&str> for AudioFormat {
+    fn from(value: &str) -> Self {
+        match value.to_lowercase().as_str() {
+            "3gp" => Self::FMT_AUDIO_3GP,
+            "ogg" | "oga" | "mogg" => Self::FMT_AUDIO_OGG,
+            "opus" => Self::FMT_AUDIO_OPUS,
+            "mp3" => Self::FMT_AUDIO_MP3,
+            _ => Self::FMT_AUDIO_UNKNOWN,
+        }
+    }
+}
+
+impl From<&Path> for AudioFormat {
+    fn from(value: &Path) -> Self {
+        if let Some(s) = value.extension().and_then(|s| s.to_str()) {
+            Self::from(s)
+        } else {
+            Self::FMT_AUDIO_UNKNOWN
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug, Serialize)]
 pub struct Song {
-    id: String,
-
     #[serde(skip_serializing)]
     path: PathBuf,
-    duration: u128,
+    duration: i64,
+    #[serde(skip_serializing)]
+    bytes: Bytes,
+    #[serde(skip_serializing)]
+    coverart: Bytes,
     tags: HashMap<String, String>,
+    id: String,
 }
 
 impl Song {
+    pub fn load(&mut self) {
+        self.bytes = Bytes::from(fs::read(&self.path).unwrap_or_default());
+
+        let mut fd = input(&self.path).expect("file was (re)moved");
+
+        //get coverart if it exists
+        if let Some(frame) = fd
+            .packets()
+            .find(|(s, _)| s.parameters().medium() == Type::Video)
+        {
+            self.coverart = Bytes::copy_from_slice(frame.1.data().unwrap_or_default());
+        }
+
+        self.tags = HashMap::from_iter(fd.metadata().iter().map(|p| (p.0.into(), p.1.into())));
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    pub fn name(&self) -> String {
-        if let Some(title) = self.tags.get("title") {
-            title.to_string()
-        } else {
-            String::from("[unknown]")
-        }
+    pub fn unload(&mut self) {
+        self.bytes.clear();
+        self.coverart.clear();
+        self.tags = HashMap::default();
     }
 
-    pub fn duration(&self) -> u128 {
+    pub fn coverart(&self) -> Bytes {
+        self.coverart.clone()
+    }
+
+    pub fn bytes(&self) -> Bytes {
+        self.bytes.clone()
+    }
+
+    pub fn duration(&self) -> i64 {
         self.duration
-    }
-
-    pub fn tags(&self) -> &HashMap<String, String> {
-        &self.tags
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
-    pub fn get_file_bytes(&self) -> Bytes {
-        Bytes::from(fs::read(&self.path).unwrap_or_default())
-    }
-
-    pub fn get_artwork_bytes(&self) -> Bytes {
-        let mut fd = input(&self.path).expect("failed to load artwork");
-        let frame = fd
-            .packets()
-            .find(|(s, _)| s.parameters().medium() == Type::Video);
-
-        Bytes::from(
-            frame
-                .and_then(|(_, p)| p.data().map(|s| s.to_vec()))
-                .unwrap_or_default(),
-        )
-    }
-
-    fn calculate_duration(&mut self, duration: i64, time_base: Rational) -> u128 {
-        (duration as f64 / time_base.denominator() as f64).ceil() as u128
-    }
-
-    pub fn load_tags_and_duration(&mut self) {
-        if self.duration > 0 {
-            return;
-        }
-
-        let fd = input(self.path()).unwrap();
-        let stream = fd.streams().best(Type::Audio).unwrap();
-        let tags = stream
-            .metadata()
-            .iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
-
-        self.tags = tags;
-        self.duration = self.calculate_duration(stream.duration(), stream.time_base());
-    }
-
-    pub fn unload_tags(&mut self) {
-        self.tags.clear();
-    }
-
-    pub fn load(&mut self) {
-        self.load_tags_and_duration();
     }
 }
 
-impl From<&walkdir::DirEntry> for Song {
-    fn from(dir: &walkdir::DirEntry) -> Self {
-        Self {
-            tags: HashMap::default(),
-            id: blake3::hash(dir.path().to_string_lossy().as_bytes()).to_string(),
-            path: dir.path().to_path_buf(),
-            duration: 0,
+impl TryFrom<&walkdir::DirEntry> for Song {
+    type Error = bool;
+
+    fn try_from(dir: &walkdir::DirEntry) -> Result<Self, Self::Error> {
+        let path = dir.path();
+
+        //do an early skip so that we don't even try to read the file further
+        //speeds up discovery
+        if AudioFormat::from(path) == AudioFormat::FMT_AUDIO_UNKNOWN {
+            println!("Unsupported file format @ {}", path.display());
+            return Err(false);
         }
+
+        let fd = input(path).expect("failed to open file");
+        let stream = match fd.streams().best(Type::Audio) {
+            Some(s) => s,
+            //no point going forward if we don't have audio track
+            _ => {
+                println!("No audio stream found @ {}", path.display());
+                return Err(false);
+            }
+        };
+
+        let duration =
+            (stream.duration() as f64 / stream.time_base().denominator() as f64).ceil() as i64;
+        let hash = blake3::hash(path.as_os_str().as_bytes())
+            .to_hex()
+            .to_string();
+
+        Ok(Self {
+            id: hash,
+            path: path.to_path_buf(),
+            duration: duration,
+            bytes: Bytes::new(),
+            coverart: Bytes::new(),
+            tags: HashMap::default(),
+        })
     }
 }
