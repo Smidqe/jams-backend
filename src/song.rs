@@ -72,7 +72,11 @@ impl Song {
             self.coverart = Bytes::copy_from_slice(frame.1.data().unwrap_or_default());
         }
 
-        self.tags = HashMap::from_iter(fd.metadata().iter().map(|p| (p.0.into(), p.1.into())));
+        //we must get tags from the audio source
+        let stream = fd.streams().best(Type::Audio).expect("");
+        let tags = stream.metadata();
+
+        self.tags = HashMap::from_iter(tags.iter().map(|p| (p.0.into(), p.1.into())));
     }
 
     pub fn id(&self) -> &str {

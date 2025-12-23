@@ -89,7 +89,10 @@ fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
         StatusCode::PARTIAL_CONTENT,
         [
             (header::CONTENT_RANGE, content_range),
-            (header::CONTENT_LENGTH, length.to_string()),
+            (
+                header::CONTENT_LENGTH,
+                (parsed_range.end - parsed_range.start).to_string(),
+            ),
         ],
         Body::from(bytes.slice(parsed_range)),
     )
@@ -102,20 +105,20 @@ struct AAA {
 }
 
 #[debug_handler]
-async fn song(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    query: Query<AAA>,
-) -> Response {
+async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    /*
     if !query.id.eq_ignore_ascii_case(state.song.read().id()) {
         return (StatusCode::NOT_FOUND).into_response();
     }
+    */
 
     let bytes = state.song.read().bytes();
 
     if headers.contains_key(RANGE) {
         return song_partial(bytes, headers);
     }
+
+    println!("Sending {} bytes", bytes.len());
 
     (
         StatusCode::OK,
@@ -200,6 +203,9 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
 
     let (mut tx, mut rx) = socket.split();
     let mut listen = state.tx.subscribe();
+    let song = state.song.read().clone();
+
+    serialize_and_send(EventKind::Song, song, &mut tx).await;
 
     let mut sending = spawn(async move {
         loop {

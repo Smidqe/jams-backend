@@ -68,6 +68,8 @@ impl Playlist {
         self.get_at_cursor_mut().load();
         self.timestamp = 0;
 
+        *state.song.write() = self.get_at_cursor().clone();
+
         let _ = state.tx.send(Command::Song {
             song: self.get_at_cursor().clone(),
         });
@@ -75,6 +77,8 @@ impl Playlist {
 
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         self.get_at_cursor_mut().load();
+
+        *state.song.write() = self.get_at_cursor().clone();
 
         loop {
             let start = Instant::now();
