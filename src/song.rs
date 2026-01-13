@@ -1,4 +1,7 @@
-use axum::body::Bytes;
+use axum::{
+    body::Bytes,
+    extract::ws::{Message, Utf8Bytes},
+};
 use ffmpeg_next::{format::input, media::Type};
 use serde::Serialize;
 use std::{
@@ -7,6 +10,8 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+
+use crate::event::Event;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
@@ -65,18 +70,18 @@ impl Song {
         let mut fd = input(&self.path).expect("file was (re)moved");
 
         //get coverart if it exists
-        if let Some(frame) = fd
+        if let Some((_, packet)) = fd
             .packets()
             .find(|(s, _)| s.parameters().medium() == Type::Video)
         {
-            self.coverart = Bytes::copy_from_slice(frame.1.data().unwrap_or_default());
+            self.coverart = Bytes::copy_from_slice(packet.data().unwrap_or_default());
         }
 
         //we must get tags from the audio source
         let stream = fd.streams().best(Type::Audio).expect("");
         let tags = stream.metadata();
 
-        self.tags = HashMap::from_iter(tags.iter().map(|p| (p.0.into(), p.1.into())));
+        self.tags = HashMap::from_iter(tags.iter().map(|(key, value)| (key.into(), value.into())));
     }
 
     pub fn id(&self) -> &str {
@@ -100,6 +105,10 @@ impl Song {
     pub fn duration(&self) -> i64 {
         self.duration
     }
+
+    pub fn as_message(&self) -> Message {
+        Event::Song.as_message_with_payload(self)
+    }
 }
 
 impl TryFrom<&walkdir::DirEntry> for Song {
@@ -111,7 +120,6 @@ impl TryFrom<&walkdir::DirEntry> for Song {
         //do an early skip so that we don't even try to read the file further
         //speeds up discovery
         if AudioFormat::from(path) == AudioFormat::FMT_AUDIO_UNKNOWN {
-            println!("Unsupported file format @ {}", path.display());
             return Err(false);
         }
 
@@ -119,14 +127,12 @@ impl TryFrom<&walkdir::DirEntry> for Song {
         let stream = match fd.streams().best(Type::Audio) {
             Some(s) => s,
             //no point going forward if we don't have audio track
-            _ => {
-                println!("No audio stream found @ {}", path.display());
-                return Err(false);
-            }
+            _ => return Err(false),
         };
 
         let duration =
             (stream.duration() as f64 / stream.time_base().denominator() as f64).ceil() as i64;
+
         let hash = blake3::hash(path.as_os_str().as_bytes())
             .to_hex()
             .to_string();

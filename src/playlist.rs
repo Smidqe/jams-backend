@@ -10,91 +10,78 @@ use std::{
 
 use rand::seq::SliceRandom;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use serde::Serialize;
 use tokio::time::Instant;
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{AppState, Command, Song, song::AudioFormat};
+use crate::{AppState, Song, event::Event, song::AudioFormat};
 
-#[derive(Clone, Serialize)]
+pub enum LoadOp {
+    Load,
+    Unload,
+}
+
 pub struct Playlist {
     songs: Vec<Song>,
-    #[serde(skip_serializing)]
-    // timestamp in ms
-    timestamp: i64,
-    // current
-    #[serde(skip_serializing)]
+    current: Song,
     cursor: usize,
+    timestamp: i64,
 }
 
 impl Playlist {
-    pub fn new(songs: Vec<Song>) -> Self {
-        let mut playlist = Self {
+    pub fn new(mut songs: Vec<Song>) -> Self {
+        songs.shuffle(&mut rand::rng());
+
+        Self {
+            current: songs.get(0).expect("").clone(),
             songs,
-            cursor: 0,
             timestamp: 0,
-        };
-
-        playlist.shuffle();
-        playlist
+            cursor: 0,
+        }
     }
 
-    fn get_at_cursor(&self) -> &Song {
-        self.songs
-            .get(self.cursor)
-            .expect("there's always one at cursor")
+    fn maybe_do_sync(&mut self, state: &Arc<AppState>) {
+        if self.timestamp > 0 && self.timestamp % 10 == 0 {
+            *state.timestamp.write() = self.timestamp;
+            let _ = state.tx.send(Event::Sync);
+        }
     }
 
-    fn get_at_cursor_mut(&mut self) -> &mut Song {
-        self.songs
-            .get_mut(self.cursor)
-            .expect("there's always one at cursor")
-    }
+    fn maybe_load_next(&mut self, state: &Arc<AppState>) {
+        if self.timestamp < self.current.duration() {
+            return;
+        }
 
-    fn shuffle(&mut self) {
-        self.songs.shuffle(&mut rand::rng());
-    }
-
-    fn load_next(&mut self, state: Arc<AppState>) {
-        self.get_at_cursor_mut().unload();
-
-        //if we're at the end, just cycle back
         if self.cursor == self.songs.len() - 1 {
             self.cursor = 0;
         } else {
             self.cursor += 1;
         }
 
-        self.get_at_cursor_mut().load();
+        self.current = self.songs.get(self.cursor).expect("").clone();
+        self.load_and_write_to_state(state);
+
+        let _ = state.tx.send(Event::Song);
+    }
+
+    fn load_and_write_to_state(&mut self, state: &Arc<AppState>) {
+        //load the current song
+        self.current.load();
         self.timestamp = 0;
 
-        *state.song.write() = self.get_at_cursor().clone();
-
-        let _ = state.tx.send(Command::Song {
-            song: self.get_at_cursor().clone(),
-        });
+        //write things to state
+        *state.timestamp.write() = self.timestamp;
+        *state.current.write() = self.current.clone();
     }
 
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
-        self.get_at_cursor_mut().load();
-
-        *state.song.write() = self.get_at_cursor().clone();
+        self.load_and_write_to_state(&state);
 
         loop {
             let start = Instant::now();
 
-            self.timestamp += 1;
-
-            if self.timestamp >= self.get_at_cursor().duration() {
-                self.load_next(state.clone())
-            }
-
             //handle sync
-            if self.timestamp > 0 && self.timestamp % 10 == 0 {
-                let _ = state.tx.send(Command::Sync {
-                    ts: self.timestamp as u64,
-                });
-            }
+            self.maybe_load_next(&state);
+            self.maybe_do_sync(&state);
 
             if shutdown.load(Ordering::Relaxed) {
                 break;
@@ -107,6 +94,8 @@ impl Playlist {
             if diff > 0 {
                 tokio::time::sleep(Duration::from_millis(diff as u64)).await;
             }
+
+            self.timestamp += 1;
         }
 
         Ok(())

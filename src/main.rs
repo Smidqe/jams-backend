@@ -1,4 +1,4 @@
-mod error;
+mod event;
 mod playlist;
 mod song;
 
@@ -14,7 +14,7 @@ use axum::{
     body::{Body, Bytes},
     debug_handler,
     extract::{
-        Query, State, WebSocketUpgrade,
+        State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
     http::{
@@ -26,13 +26,37 @@ use axum::{
 };
 
 use clap::Parser;
-use futures::{SinkExt, StreamExt, stream::SplitSink};
+use futures::{SinkExt, StreamExt};
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange};
+use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use tokio::{spawn, sync::broadcast, try_join};
 
-use crate::{playlist::Playlist, song::Song};
+use crate::{event::Event, playlist::Playlist, song::Song};
+
+pub struct Artwork(OnceCell<Bytes>);
+
+impl Artwork {
+    pub const fn new() -> Artwork {
+        Artwork(OnceCell::new())
+    }
+
+    pub fn load_from_path(&self, path: &Path) {
+        self.0.get_or_init(|| {
+            Bytes::from(fs::read(path).expect("can't function without default artwork"))
+        });
+    }
+
+    pub fn get(&self) -> Bytes {
+        if let Some(bytes) = self.0.get() {
+            Bytes::copy_from_slice(bytes)
+        } else {
+            Bytes::new()
+        }
+    }
+}
+
+static DEFAULT_ARTWORK: Artwork = Artwork::new();
 
 pub struct RequestedRange {
     pub start: usize,
@@ -63,18 +87,13 @@ fn get_range_from_header(headers: &HeaderMap, size: u64) -> Range<usize> {
     let header = headers.get(RANGE).expect("range check missing");
     let presentation = header.to_str().expect("range header should be well formed");
 
+    println!("range: {}", presentation);
+
     match http_range_header::parse_range_header(presentation) {
         //TODO: Support multipart ranges
         Ok(r) => get_numerical_range_from_range(&r.ranges[0], size),
         Err(_) => 0..0,
     }
-}
-
-async fn authenticate_session(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    //ensure we have a proper header
-    //ensure we have
-
-    Response::default()
 }
 
 fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
@@ -99,26 +118,13 @@ fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct AAA {
-    id: String,
-}
-
 #[debug_handler]
 async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    /*
-    if !query.id.eq_ignore_ascii_case(state.song.read().id()) {
-        return (StatusCode::NOT_FOUND).into_response();
-    }
-    */
-
-    let bytes = state.song.read().bytes();
+    let bytes = state.current.read().bytes();
 
     if headers.contains_key(RANGE) {
         return song_partial(bytes, headers);
     }
-
-    println!("Sending {} bytes", bytes.len());
 
     (
         StatusCode::OK,
@@ -133,9 +139,9 @@ async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Respons
 
 #[debug_handler]
 async fn artwork(State(state): State<Arc<AppState>>) -> Response {
-    let bytes = state.song.read().coverart();
+    let bytes = state.current.read().coverart();
     let body = if bytes.is_empty() {
-        Body::from(Bytes::copy_from_slice(&state.default_artwork))
+        Body::from(DEFAULT_ARTWORK.get())
     } else {
         Body::from(bytes)
     };
@@ -148,52 +154,16 @@ async fn artwork(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AppState {
-    song: Arc<RwLock<Song>>,
-    tx: broadcast::Sender<Command>,
-    default_artwork: Arc<Bytes>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Command {
-    Shutdown,
-    Song { song: Song },
-    Sync { ts: u64 },
-    Ping,
-}
-
-#[derive(Serialize)]
-pub enum EventKind {
-    Song,
-    Sync,
-    Playlist,
-}
-
-#[derive(Serialize)]
-pub struct Event<T>
-where
-    T: Serialize,
-{
-    kind: EventKind,
-    payload: T,
+    current: Arc<RwLock<Song>>,
+    timestamp: Arc<RwLock<i64>>,
+    tx: broadcast::Sender<Event>,
 }
 
 #[debug_handler]
 async fn ws_upgrader(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     ws.on_upgrade(|s| ws_handler(s, state))
-}
-
-async fn serialize_and_send<T: Serialize>(
-    kind: EventKind,
-    payload: T,
-    tx: &mut SplitSink<WebSocket, Message>,
-) {
-    let ev = serde_json::to_string(&Event { kind, payload });
-
-    if let Ok(s) = ev {
-        let _ = tx.send(Message::Text(Utf8Bytes::from(s))).await;
-    }
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
@@ -203,22 +173,26 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
 
     let (mut tx, mut rx) = socket.split();
     let mut listen = state.tx.subscribe();
-    let song = state.song.read().clone();
 
-    serialize_and_send(EventKind::Song, song, &mut tx).await;
+    let _ = tx.send(state.current.read().as_message());
+    let _ = tx.send(Event::as_message_with_payload_str(
+        &Event::Sync,
+        &state.timestamp.read().to_string(),
+    ));
 
     let mut sending = spawn(async move {
         loop {
-            match listen.recv().await {
-                Ok(Command::Shutdown) => break,
-                Ok(Command::Song { song }) => {
-                    serialize_and_send(EventKind::Song, song, &mut tx).await
-                }
-                Ok(Command::Sync { ts }) => serialize_and_send(EventKind::Sync, ts, &mut tx).await,
-                Ok(Command::Ping) => {
-                    let _ = tx.send(Message::Ping(Bytes::new())).await;
-                }
-                Err(e) => println!("err {}", e),
+            let ev = match listen.recv().await {
+                Ok(Event::Song) => state.current.read().as_message(),
+                Ok(Event::Sync) => Event::as_message_with_payload_str(
+                    &Event::Sync,
+                    &state.timestamp.read().to_string(),
+                ),
+                _ => Message::Text(Utf8Bytes::default()),
+            };
+
+            if let Err(e) = tx.send(ev).await {
+                eprintln!("[ws]: Failed to broadcast a message: {}", e);
             }
         }
     });
@@ -228,7 +202,6 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
         loop {
             match rx.next().await {
                 Some(Ok(Message::Close(_))) => {
-                    println!("[ws]: Received a normal close");
                     break;
                 }
                 Some(Err(e)) => {
@@ -236,8 +209,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
                     break;
                 }
                 Some(Ok(m)) => match m {
-                    Message::Pong(_) => (),
-                    _ => println!("[ws]: Got a message of {:?}", m),
+                    Message::Pong(_) | _ => (),
                 },
                 None => (),
             }
@@ -254,10 +226,6 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-fn get_default_artwork(path: &Path) -> Bytes {
-    Bytes::from(fs::read(path).expect("can't function without default artwork"))
-}
-
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long)]
@@ -271,20 +239,21 @@ async fn main() {
     ffmpeg_next::init().expect("eee");
 
     let args = Args::parse();
-
-    let source = PathBuf::try_from(args.source.as_str()).expect("source folder does not exist");
-    let artwork_path = PathBuf::try_from(args.artwork.as_str()).expect("artwork does not exist");
+    DEFAULT_ARTWORK
+        .load_from_path(&PathBuf::try_from(args.artwork.as_str()).expect("artwork does not exist"));
 
     let (tx, _rx) = broadcast::channel(1000);
-    let state = Arc::new(AppState {
-        song: Arc::new(RwLock::new(Song::default())),
-        tx,
+    let song_folder =
+        PathBuf::try_from(args.source.as_str()).expect("source folder does not exist");
 
-        default_artwork: Arc::new(get_default_artwork(artwork_path.as_path())),
+    let state = Arc::new(AppState {
+        current: Arc::new(RwLock::new(Song::default())),
+        timestamp: Arc::new(RwLock::new(0)),
+        tx: tx.clone(),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let playlist = spawn(Playlist::from(source.as_path()).run(state.clone(), shutdown.clone()));
+    let playlist = spawn(Playlist::from(song_folder).run(state.clone(), shutdown.clone()));
 
     let app = Router::new()
         .route("/version", get(version))
