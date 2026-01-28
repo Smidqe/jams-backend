@@ -6,7 +6,10 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use axum::{
@@ -15,24 +18,25 @@ use axum::{
     debug_handler,
     extract::{
         State, WebSocketUpgrade,
-        ws::{Message, Utf8Bytes, WebSocket},
+        ws::{Message, WebSocket},
     },
     http::{
         HeaderMap, StatusCode,
-        header::{self, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE, RANGE},
+        header::{
+            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+        },
     },
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 
+use crate::{playlist::Playlist, song::Song};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange};
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use tokio::{spawn, sync::broadcast, try_join};
-
-use crate::{event::Event, playlist::Playlist, song::Song};
 
 pub struct Artwork(OnceCell<Bytes>);
 
@@ -58,22 +62,18 @@ impl Artwork {
 
 static DEFAULT_ARTWORK: Artwork = Artwork::new();
 
-pub struct RequestedRange {
-    pub start: usize,
-    pub end: usize,
-}
-
 #[debug_handler]
 async fn version() -> Response {
     (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")]).into_response()
 }
 
 fn get_numerical_range_from_range(range: &SyntacticallyCorrectRange, max: u64) -> Range<usize> {
+    let max_index = max - 1;
     let (start, end) = match (range.start, range.end) {
         //-xxx
-        (StartPosition::FromLast(start), EndPosition::LastByte) => (max - start, max),
+        (StartPosition::FromLast(start), EndPosition::LastByte) => (max_index - start, max_index),
         //xxx-
-        (StartPosition::Index(start), EndPosition::LastByte) => (start, max),
+        (StartPosition::Index(start), EndPosition::LastByte) => (start, max_index),
         //xxx-yyy
         (StartPosition::Index(start), EndPosition::Index(end)) => (start, end),
         //there's theoretical FromLast, Index range, but that doesn't make any sense
@@ -96,7 +96,7 @@ fn get_range_from_header(headers: &HeaderMap, size: u64) -> Range<usize> {
     }
 }
 
-fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
+fn song_partial(bytes: Bytes, headers: HeaderMap, content_type: &str) -> Response {
     let length = bytes.len() as u64;
     let parsed_range = get_range_from_header(&headers, length);
     let content_range = format!(
@@ -104,32 +104,44 @@ fn song_partial(bytes: Bytes, headers: HeaderMap) -> Response {
         parsed_range.start, parsed_range.end, length
     );
 
+    println!("{:?}", headers);
+    println!("{:?}", parsed_range);
+    println!("{:?}", content_range);
+
+    let slice = bytes.slice(parsed_range);
+    let size = slice.len();
+    let body = Body::from(slice);
+
+    println!("size {size}");
+
     (
         StatusCode::PARTIAL_CONTENT,
         [
-            (header::CONTENT_RANGE, content_range),
-            (
-                header::CONTENT_LENGTH,
-                (parsed_range.end - parsed_range.start).to_string(),
-            ),
+            (ACCEPT_RANGES, "bytes".to_string()),
+            (CONTENT_RANGE, content_range),
+            (CONTENT_TYPE, "audio/ogg".to_string()),
+            (CONTENT_LENGTH, size.to_string()),
         ],
-        Body::from(bytes.slice(parsed_range)),
+        body,
     )
         .into_response()
 }
 
 #[debug_handler]
 async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let bytes = state.current.read().bytes();
+    let bytes = state.now.read().bytes();
+    let content_type = state.now.read().get_content_type().to_string();
 
     if headers.contains_key(RANGE) {
-        return song_partial(bytes, headers);
+        return song_partial(bytes, headers, content_type.as_str());
     }
 
     (
         StatusCode::OK,
         [
             (ACCEPT_RANGES, "bytes"),
+            (CONTENT_TYPE, "audio/ogg"),
+            (CACHE_CONTROL, "no-cache"),
             (CONTENT_LENGTH, &bytes.len().to_string()),
         ],
         Body::from(bytes),
@@ -139,7 +151,7 @@ async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Respons
 
 #[debug_handler]
 async fn artwork(State(state): State<Arc<AppState>>) -> Response {
-    let bytes = state.current.read().coverart();
+    let bytes = state.now.read().coverart();
     let body = if bytes.is_empty() {
         Body::from(DEFAULT_ARTWORK.get())
     } else {
@@ -156,9 +168,9 @@ async fn artwork(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Clone)]
 struct AppState {
-    current: Arc<RwLock<Song>>,
-    timestamp: Arc<RwLock<i64>>,
-    tx: broadcast::Sender<Event>,
+    now: Arc<RwLock<Song>>,
+    broadcast: broadcast::Sender<Message>,
+    playlist: Arc<RwLock<Vec<Song>>>,
 }
 
 #[debug_handler]
@@ -172,23 +184,19 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     let (mut tx, mut rx) = socket.split();
-    let mut listen = state.tx.subscribe();
-
-    let _ = tx.send(state.current.read().as_message());
-    let _ = tx.send(Event::as_message_with_payload_str(
-        &Event::Sync,
-        &state.timestamp.read().to_string(),
-    ));
+    let mut listen = state.broadcast.subscribe();
 
     let mut sending = spawn(async move {
+        let msg = state.now.read().as_message();
+
+        if let Err(e) = tx.send(msg).await {
+            println!("{}", e)
+        }
+
         loop {
-            let ev = match listen.recv().await {
-                Ok(Event::Song) => state.current.read().as_message(),
-                Ok(Event::Sync) => Event::as_message_with_payload_str(
-                    &Event::Sync,
-                    &state.timestamp.read().to_string(),
-                ),
-                _ => Message::Text(Utf8Bytes::default()),
+            let ev: Message = match listen.recv().await {
+                Ok(msg) => msg,
+                _ => continue,
             };
 
             if let Err(e) = tx.send(ev).await {
@@ -242,14 +250,14 @@ async fn main() {
     DEFAULT_ARTWORK
         .load_from_path(&PathBuf::try_from(args.artwork.as_str()).expect("artwork does not exist"));
 
-    let (tx, _rx) = broadcast::channel(1000);
+    let (tx, _) = broadcast::channel(1000);
     let song_folder =
         PathBuf::try_from(args.source.as_str()).expect("source folder does not exist");
 
     let state = Arc::new(AppState {
-        current: Arc::new(RwLock::new(Song::default())),
-        timestamp: Arc::new(RwLock::new(0)),
-        tx: tx.clone(),
+        now: Arc::new(RwLock::new(Song::default())),
+        broadcast: tx,
+        playlist: Arc::new(RwLock::new(Vec::new())),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -268,6 +276,7 @@ async fn main() {
     )
     .await
     .unwrap();
+    shutdown.store(true, Ordering::Relaxed);
 
     let _ = try_join!(playlist);
 }

@@ -1,7 +1,4 @@
-use axum::{
-    body::Bytes,
-    extract::ws::{Message, Utf8Bytes},
-};
+use axum::{body::Bytes, extract::ws::Message};
 use ffmpeg_next::{format::input, media::Type};
 use serde::Serialize;
 use std::{
@@ -11,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::event::Event;
+use crate::event::{Event, EventKind};
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
@@ -60,13 +57,16 @@ pub struct Song {
     #[serde(skip_serializing)]
     coverart: Bytes,
     tags: HashMap<String, String>,
+    content_type: String,
     id: String,
 }
 
 impl Song {
     pub fn load(&mut self) {
+        //read the file as a whole
         self.bytes = Bytes::from(fs::read(&self.path).unwrap_or_default());
 
+        //open it in ffmpeg
         let mut fd = input(&self.path).expect("file was (re)moved");
 
         //get coverart if it exists
@@ -78,10 +78,10 @@ impl Song {
         }
 
         //we must get tags from the audio source
-        let stream = fd.streams().best(Type::Audio).expect("");
-        let tags = stream.metadata();
-
-        self.tags = HashMap::from_iter(tags.iter().map(|(key, value)| (key.into(), value.into())));
+        if let Some(stream) = fd.streams().best(Type::Audio) {
+            self.tags =
+                HashMap::from_iter(stream.metadata().iter().map(|(k, v)| (k.into(), v.into())))
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -107,7 +107,11 @@ impl Song {
     }
 
     pub fn as_message(&self) -> Message {
-        Event::Song.as_message_with_payload(self)
+        Event::new_as_message(EventKind::Song, self.clone())
+    }
+
+    pub fn get_content_type(&self) -> &str {
+        self.content_type.as_str()
     }
 }
 
@@ -116,10 +120,10 @@ impl TryFrom<&walkdir::DirEntry> for Song {
 
     fn try_from(dir: &walkdir::DirEntry) -> Result<Self, Self::Error> {
         let path = dir.path();
-
+        let format = AudioFormat::from(path);
         //do an early skip so that we don't even try to read the file further
         //speeds up discovery
-        if AudioFormat::from(path) == AudioFormat::FMT_AUDIO_UNKNOWN {
+        if format == AudioFormat::FMT_AUDIO_UNKNOWN {
             return Err(false);
         }
 
@@ -137,6 +141,12 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             .to_hex()
             .to_string();
 
+        let content_type = match format {
+            AudioFormat::FMT_AUDIO_OGG => "audio/ogg",
+            AudioFormat::FMT_AUDIO_OPUS => "audio/opus",
+            _ => return Err(false),
+        };
+
         Ok(Self {
             id: hash,
             path: path.to_path_buf(),
@@ -144,6 +154,7 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             bytes: Bytes::new(),
             coverart: Bytes::new(),
             tags: HashMap::default(),
+            content_type: content_type.to_string(),
         })
     }
 }
