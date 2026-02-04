@@ -16,7 +16,6 @@ use walkdir::{DirEntry, WalkDir};
 use crate::{
     AppState, Song,
     event::{Event, EventKind},
-    song::AudioFormat,
 };
 
 pub struct Playlist {
@@ -143,15 +142,7 @@ impl From<&Path> for Playlist {
     fn from(path: &Path) -> Self {
         let entries: Vec<DirEntry> = WalkDir::new(path)
             .into_iter()
-            .filter_map(|entry| {
-                if let Ok(e) = entry
-                    && AudioFormat::from(e.path()) != AudioFormat::FMT_AUDIO_UNKNOWN
-                {
-                    Some(e)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|entry| entry.ok())
             .collect();
 
         if entries.len() == 0 {

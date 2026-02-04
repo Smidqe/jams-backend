@@ -10,43 +10,6 @@ use std::{
 
 use crate::event::{Event, EventKind};
 
-#[allow(non_camel_case_types)]
-#[derive(Debug, PartialEq)]
-pub enum AudioFormat {
-    FMT_AUDIO_UNKNOWN,
-    FMT_AUDIO_3GP,
-    FMT_AUDIO_AA,
-    FMT_AUDIO_AAC,
-    FMT_AUDIO_AAX,
-    FMT_AUDIO_ACT,
-
-    FMT_AUDIO_OGG,
-    FMT_AUDIO_MP3,
-    FMT_AUDIO_OPUS,
-}
-
-impl From<&str> for AudioFormat {
-    fn from(value: &str) -> Self {
-        match value.to_lowercase().as_str() {
-            "3gp" => Self::FMT_AUDIO_3GP,
-            "ogg" | "oga" | "mogg" => Self::FMT_AUDIO_OGG,
-            "opus" => Self::FMT_AUDIO_OPUS,
-            "mp3" => Self::FMT_AUDIO_MP3,
-            _ => Self::FMT_AUDIO_UNKNOWN,
-        }
-    }
-}
-
-impl From<&Path> for AudioFormat {
-    fn from(value: &Path) -> Self {
-        if let Some(s) = value.extension().and_then(|s| s.to_str()) {
-            Self::from(s)
-        } else {
-            Self::FMT_AUDIO_UNKNOWN
-        }
-    }
-}
-
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Song {
     #[serde(skip_serializing)]
@@ -57,6 +20,7 @@ pub struct Song {
     #[serde(skip_serializing)]
     coverart: Bytes,
     tags: HashMap<String, String>,
+    #[serde(skip_serializing)]
     content_type: String,
     id: String,
 }
@@ -120,10 +84,9 @@ impl TryFrom<&walkdir::DirEntry> for Song {
 
     fn try_from(dir: &walkdir::DirEntry) -> Result<Self, Self::Error> {
         let path = dir.path();
-        let format = AudioFormat::from(path);
-        //do an early skip so that we don't even try to read the file further
-        //speeds up discovery
-        if format == AudioFormat::FMT_AUDIO_UNKNOWN {
+        let content_type = mime_guess::from_path(&path);
+
+        if content_type.is_empty() {
             return Err(false);
         }
 
@@ -141,12 +104,6 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             .to_hex()
             .to_string();
 
-        let content_type = match format {
-            AudioFormat::FMT_AUDIO_OGG => "audio/ogg",
-            AudioFormat::FMT_AUDIO_OPUS => "audio/opus",
-            _ => return Err(false),
-        };
-
         Ok(Self {
             id: hash,
             path: path.to_path_buf(),
@@ -154,7 +111,7 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             bytes: Bytes::new(),
             coverart: Bytes::new(),
             tags: HashMap::default(),
-            content_type: content_type.to_string(),
+            content_type: content_type.first().expect("aa").to_string(),
         })
     }
 }

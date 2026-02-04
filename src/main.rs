@@ -104,22 +104,16 @@ fn song_partial(bytes: Bytes, headers: HeaderMap, content_type: &str) -> Respons
         parsed_range.start, parsed_range.end, length
     );
 
-    println!("{:?}", headers);
-    println!("{:?}", parsed_range);
-    println!("{:?}", content_range);
-
     let slice = bytes.slice(parsed_range);
     let size = slice.len();
     let body = Body::from(slice);
-
-    println!("size {size}");
 
     (
         StatusCode::PARTIAL_CONTENT,
         [
             (ACCEPT_RANGES, "bytes".to_string()),
             (CONTENT_RANGE, content_range),
-            (CONTENT_TYPE, "audio/ogg".to_string()),
+            (CONTENT_TYPE, content_type.to_string()),
             (CONTENT_LENGTH, size.to_string()),
         ],
         body,
@@ -133,14 +127,14 @@ async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Respons
     let content_type = state.now.read().get_content_type().to_string();
 
     if headers.contains_key(RANGE) {
-        return song_partial(bytes, headers, content_type.as_str());
+        return song_partial(bytes, headers, &content_type);
     }
 
     (
         StatusCode::OK,
         [
             (ACCEPT_RANGES, "bytes"),
-            (CONTENT_TYPE, "audio/ogg"),
+            (CONTENT_TYPE, &content_type),
             (CACHE_CONTROL, "no-cache"),
             (CONTENT_LENGTH, &bytes.len().to_string()),
         ],
@@ -216,9 +210,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
                     println!("[ws]: Connection ended with an error {}", e);
                     break;
                 }
-                Some(Ok(m)) => match m {
-                    Message::Pong(_) | _ => (),
-                },
+                Some(Ok(_)) => (),
                 None => (),
             }
         }
