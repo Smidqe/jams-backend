@@ -6,6 +6,7 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,13 +22,13 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
         },
     },
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    response::{self, IntoResponse, Response},
+    routing::{any, get, head},
 };
 
 use crate::{playlist::Playlist, song::Song};
@@ -63,8 +64,8 @@ impl Artwork {
 static DEFAULT_ARTWORK: Artwork = Artwork::new();
 
 #[debug_handler]
-async fn version() -> Response {
-    (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")]).into_response()
+async fn version() -> impl IntoResponse {
+    (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")])
 }
 
 fn get_numerical_range_from_range(range: &SyntacticallyCorrectRange, max: u64) -> Range<usize> {
@@ -83,68 +84,66 @@ fn get_numerical_range_from_range(range: &SyntacticallyCorrectRange, max: u64) -
     (start as usize)..(end as usize)
 }
 
-fn get_range_from_header(headers: &HeaderMap, size: u64) -> Range<usize> {
-    let header = headers.get(RANGE).expect("range check missing");
-    let presentation = header.to_str().expect("range header should be well formed");
-
-    println!("range: {}", presentation);
-
-    match http_range_header::parse_range_header(presentation) {
+fn get_range_from_header(range: &HeaderValue, size: u64) -> Range<usize> {
+    match http_range_header::parse_range_header(
+        range.to_str().expect("range header should be well formed"),
+    ) {
         //TODO: Support multipart ranges
         Ok(r) => get_numerical_range_from_range(&r.ranges[0], size),
         Err(_) => 0..0,
     }
 }
 
-fn song_partial(bytes: Bytes, headers: HeaderMap, content_type: &str) -> Response {
-    let length = bytes.len() as u64;
-    let parsed_range = get_range_from_header(&headers, length);
-    let content_range = format!(
-        "bytes {}-{}/{}",
-        parsed_range.start, parsed_range.end, length
+#[debug_handler]
+async fn song2(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let song = state.now.read();
+    let bytes = song.bytes();
+
+    let mut response_headers = HeaderMap::new();
+
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(song.get_content_type()).unwrap(),
     );
 
-    let slice = bytes.slice(parsed_range);
-    let size = slice.len();
-    let body = Body::from(slice);
+    let (status, length, body) = if let Some(range) = headers.get(RANGE) {
+        let length = bytes.len();
+        let mut parsed_range = get_range_from_header(range, length as u64);
+        let content_range = format!(
+            "bytes {}-{}/{}",
+            parsed_range.start, parsed_range.end, length
+        );
 
-    (
-        StatusCode::PARTIAL_CONTENT,
-        [
-            (ACCEPT_RANGES, "bytes".to_string()),
-            (CONTENT_RANGE, content_range),
-            (CONTENT_TYPE, content_type.to_string()),
-            (CONTENT_LENGTH, size.to_string()),
-        ],
-        body,
-    )
-        .into_response()
+        // if we get a request for last byte, eg. 0-0/1 the parsed range is not enough and we end up skipping a single byte
+        // this makes client request constantly for the last byte in a never ending loop
+        if parsed_range.len() == 0 && parsed_range.end == length - 1 {
+            parsed_range = Range {
+                start: parsed_range.end,
+                end: length,
+            }
+        }
+
+        let slice = bytes.slice(parsed_range.clone());
+
+        response_headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(content_range.as_str()).unwrap(),
+        );
+
+        (StatusCode::PARTIAL_CONTENT, slice.len(), Body::from(slice))
+    } else {
+        (StatusCode::OK, bytes.len(), Body::from(bytes))
+    };
+
+    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+
+    (status, response_headers, body)
 }
 
 #[debug_handler]
-async fn song(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let bytes = state.now.read().bytes();
-    let content_type = state.now.read().get_content_type().to_string();
-
-    if headers.contains_key(RANGE) {
-        return song_partial(bytes, headers, &content_type);
-    }
-
-    (
-        StatusCode::OK,
-        [
-            (ACCEPT_RANGES, "bytes"),
-            (CONTENT_TYPE, &content_type),
-            (CACHE_CONTROL, "no-cache"),
-            (CONTENT_LENGTH, &bytes.len().to_string()),
-        ],
-        Body::from(bytes),
-    )
-        .into_response()
-}
-
-#[debug_handler]
-async fn artwork(State(state): State<Arc<AppState>>) -> Response {
+async fn artwork(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let bytes = state.now.read().coverart();
     let body = if bytes.is_empty() {
         Body::from(DEFAULT_ARTWORK.get())
@@ -157,7 +156,6 @@ async fn artwork(State(state): State<Arc<AppState>>) -> Response {
         [(CONTENT_TYPE, "application/octet-stream")],
         body,
     )
-        .into_response()
 }
 
 #[derive(Clone)]
@@ -234,6 +232,11 @@ struct Args {
     source: String,
 }
 
+#[debug_handler]
+async fn handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    println!("heade {:?}", headers);
+}
+
 #[tokio::main]
 async fn main() {
     ffmpeg_next::init().expect("eee");
@@ -257,7 +260,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/version", get(version))
-        .route("/stream", get(song))
+        .route("/stream", get(song2))
+        .route("/stream", head(handler))
         .route("/ws", any(ws_upgrader))
         .route("/artwork", get(artwork))
         .with_state(state);

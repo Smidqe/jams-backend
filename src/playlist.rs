@@ -73,6 +73,10 @@ impl Playlist {
         self.current.load();
     }
 
+    fn unload_song_at_cursor(&mut self) {
+        self.songs.get_mut(self.cursor).expect("").unload();
+    }
+
     fn maybe_do_sync(&self, state: &Arc<AppState>) {
         if self.timestamp < 0 || self.timestamp % 10 != 0 {
             return;

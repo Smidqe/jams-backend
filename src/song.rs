@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fs,
+    ops::RangeBounds,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
@@ -64,6 +65,10 @@ impl Song {
 
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
+    }
+
+    pub fn bytes_slice(&self, range: impl RangeBounds<usize>) -> Bytes {
+        self.bytes.slice(range)
     }
 
     pub fn duration(&self) -> i64 {
