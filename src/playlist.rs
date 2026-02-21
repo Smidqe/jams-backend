@@ -73,10 +73,6 @@ impl Playlist {
         self.current.load();
     }
 
-    fn unload_song_at_cursor(&mut self) {
-        self.songs.get_mut(self.cursor).expect("").unload();
-    }
-
     fn maybe_do_sync(&self, state: &Arc<AppState>) {
         if self.timestamp < 0 || self.timestamp % 10 != 0 {
             return;
@@ -103,12 +99,14 @@ impl Playlist {
     }
 
     fn broadcast_song(&self, state: &Arc<AppState>) {
-        let _ = state
-            .broadcast
-            .send(Event::new(EventKind::Song, self.current.clone()).into());
+        let _ = state.broadcast.send(self.current.clone().as_message());
+
+        //TODO: Broadcast next <x> songs
+        // let _ = state.broadcast(Event::new(EventKind::Upcoming, self.get_next_songs()).into())
     }
 
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
+        println!("running playlist");
         self.write_current_to_state(&state);
         self.write_playlist_to_state(&state);
 
@@ -149,13 +147,15 @@ impl From<&Path> for Playlist {
             .filter_map(|entry| entry.ok())
             .collect();
 
-        if entries.len() == 0 {
+        if entries.is_empty() {
             panic!("no songs at given path");
         }
 
+        println!("all gone");
+
         Self::new(
             entries
-                .par_iter()
+                .iter()
                 .filter_map(|s| Song::try_from(s).ok())
                 .collect(),
         )

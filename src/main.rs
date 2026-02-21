@@ -27,14 +27,15 @@ use axum::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
         },
     },
-    response::{self, IntoResponse, Response},
-    routing::{any, get, head},
+    response::{IntoResponse, Response},
+    routing::{any, get},
 };
 
 use crate::{playlist::Playlist, song::Song};
+use anyhow::Result;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange};
+use http_range_header::{EndPosition, StartPosition};
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use tokio::{spawn, sync::broadcast, try_join};
@@ -68,37 +69,28 @@ async fn version() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")])
 }
 
-fn get_numerical_range_from_range(range: &SyntacticallyCorrectRange, max: u64) -> Range<usize> {
-    let max_index = max - 1;
-    let (start, end) = match (range.start, range.end) {
-        //-xxx
-        (StartPosition::FromLast(start), EndPosition::LastByte) => (max_index - start, max_index),
+fn get_header_and_byte_ranges(
+    range: &HeaderValue,
+    length: usize,
+) -> Result<(Range<u64>, Range<usize>)> {
+    let range = http_range_header::parse_range_header(range.to_str()?)?.ranges[0];
+
+    match (range.start, range.end) {
         //xxx-
-        (StartPosition::Index(start), EndPosition::LastByte) => (start, max_index),
+        (StartPosition::Index(start), EndPosition::LastByte) => {
+            Ok((start..(length - 1) as u64, (start as usize)..length))
+        }
         //xxx-yyy
-        (StartPosition::Index(start), EndPosition::Index(end)) => (start, end),
-        //there's theoretical FromLast, Index range, but that doesn't make any sense
+        (StartPosition::Index(start), EndPosition::Index(end)) => {
+            Ok((start..end, start as usize..end as usize))
+        }
         _ => unreachable!(),
-    };
-
-    (start as usize)..(end as usize)
-}
-
-fn get_range_from_header(range: &HeaderValue, size: u64) -> Range<usize> {
-    match http_range_header::parse_range_header(
-        range.to_str().expect("range header should be well formed"),
-    ) {
-        //TODO: Support multipart ranges
-        Ok(r) => get_numerical_range_from_range(&r.ranges[0], size),
-        Err(_) => 0..0,
     }
 }
 
 #[debug_handler]
 async fn song2(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let song = state.now.read();
-    let bytes = song.bytes();
-
     let mut response_headers = HeaderMap::new();
 
     response_headers.insert(
@@ -107,32 +99,32 @@ async fn song2(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl I
     );
 
     let (status, length, body) = if let Some(range) = headers.get(RANGE) {
-        let length = bytes.len();
-        let mut parsed_range = get_range_from_header(range, length as u64);
-        let content_range = format!(
-            "bytes {}-{}/{}",
-            parsed_range.start, parsed_range.end, length
-        );
+        let (header_range, byte_range) =
+            match get_header_and_byte_ranges(range, song.content_length()) {
+                Ok(s) => s,
+                Err(_) => return (StatusCode::BAD_REQUEST, HeaderMap::new(), Body::empty()),
+            };
 
-        // if we get a request for last byte, eg. 0-0/1 the parsed range is not enough and we end up skipping a single byte
-        // this makes client request constantly for the last byte in a never ending loop
-        if parsed_range.len() == 0 && parsed_range.end == length - 1 {
-            parsed_range = Range {
-                start: parsed_range.end,
-                end: length,
-            }
-        }
-
-        let slice = bytes.slice(parsed_range.clone());
+        let slice = song.bytes_slice(byte_range);
 
         response_headers.insert(
             CONTENT_RANGE,
-            HeaderValue::from_str(content_range.as_str()).unwrap(),
+            HeaderValue::from_str(&format!(
+                "bytes {}-{}/{}",
+                header_range.start,
+                header_range.end,
+                song.content_length()
+            ))
+            .unwrap(),
         );
 
         (StatusCode::PARTIAL_CONTENT, slice.len(), Body::from(slice))
     } else {
-        (StatusCode::OK, bytes.len(), Body::from(bytes))
+        (
+            StatusCode::OK,
+            song.content_length(),
+            Body::from(song.bytes()),
+        )
     };
 
     response_headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
@@ -232,22 +224,15 @@ struct Args {
     source: String,
 }
 
-#[debug_handler]
-async fn handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    println!("heade {:?}", headers);
-}
-
 #[tokio::main]
 async fn main() {
     ffmpeg_next::init().expect("eee");
 
     let args = Args::parse();
-    DEFAULT_ARTWORK
-        .load_from_path(&PathBuf::try_from(args.artwork.as_str()).expect("artwork does not exist"));
+    DEFAULT_ARTWORK.load_from_path(&PathBuf::from(args.artwork.as_str()));
 
     let (tx, _) = broadcast::channel(1000);
-    let song_folder =
-        PathBuf::try_from(args.source.as_str()).expect("source folder does not exist");
+    let song_folder = PathBuf::from(args.source.as_str());
 
     let state = Arc::new(AppState {
         now: Arc::new(RwLock::new(Song::default())),
@@ -261,7 +246,6 @@ async fn main() {
     let app = Router::new()
         .route("/version", get(version))
         .route("/stream", get(song2))
-        .route("/stream", head(handler))
         .route("/ws", any(ws_upgrader))
         .route("/artwork", get(artwork))
         .with_state(state);

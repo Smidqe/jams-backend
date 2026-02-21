@@ -3,7 +3,7 @@ use ffmpeg_next::{format::input, media::Type};
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs,
+    fmt, fs,
     ops::RangeBounds,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -71,6 +71,10 @@ impl Song {
         self.bytes.slice(range)
     }
 
+    pub fn content_length(&self) -> usize {
+        self.bytes.len()
+    }
+
     pub fn duration(&self) -> i64 {
         self.duration
     }
@@ -89,13 +93,17 @@ impl TryFrom<&walkdir::DirEntry> for Song {
 
     fn try_from(dir: &walkdir::DirEntry) -> Result<Self, Self::Error> {
         let path = dir.path();
-        let content_type = mime_guess::from_path(&path);
+        let content_type = mime_guess::from_path(path);
 
         if content_type.is_empty() {
             return Err(false);
         }
 
-        let fd = input(path).expect("failed to open file");
+        if dir.file_type().is_dir() {
+            return Err(false);
+        }
+
+        let fd = input(path).expect(&format!("failed to open file at {:?}", &path));
         let stream = match fd.streams().best(Type::Audio) {
             Some(s) => s,
             //no point going forward if we don't have audio track
@@ -112,7 +120,7 @@ impl TryFrom<&walkdir::DirEntry> for Song {
         Ok(Self {
             id: hash,
             path: path.to_path_buf(),
-            duration: duration,
+            duration,
             bytes: Bytes::new(),
             coverart: Bytes::new(),
             tags: HashMap::default(),
