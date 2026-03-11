@@ -56,7 +56,7 @@ impl Playlist {
         self.timestamp = 0;
     }
 
-    fn get_next_songs(&self, count: usize) -> Vec<Song> {
+    pub fn get_next_songs(&self, count: usize) -> Vec<Song> {
         self.songs.iter().cycle().take(count).cloned().collect()
     }
 
@@ -107,6 +107,7 @@ impl Playlist {
 
     pub async fn run(mut self, state: Arc<AppState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         println!("running playlist");
+
         self.write_current_to_state(&state);
         self.write_playlist_to_state(&state);
 
@@ -148,17 +149,17 @@ impl From<&Path> for Playlist {
             .collect();
 
         if entries.is_empty() {
-            panic!("no songs at given path");
+            panic!("[playlist]: No songs in {:?}", &path);
         }
 
-        println!("all gone");
+        let songs: Vec<Song> = entries
+            .par_iter()
+            .filter_map(|s| Song::try_from(s).ok())
+            .collect();
 
-        Self::new(
-            entries
-                .iter()
-                .filter_map(|s| Song::try_from(s).ok())
-                .collect(),
-        )
+        println!("[playlist]: Amount of songs found: {}", songs.len());
+
+        Self::new(songs)
     }
 }
 

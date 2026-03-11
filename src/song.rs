@@ -1,13 +1,7 @@
 use axum::{body::Bytes, extract::ws::Message};
 use ffmpeg_next::{format::input, media::Type};
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    fmt, fs,
-    ops::RangeBounds,
-    os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, fs, ops::RangeBounds, os::unix::ffi::OsStrExt, path::PathBuf};
 
 use crate::event::{Event, EventKind};
 
@@ -28,6 +22,8 @@ pub struct Song {
 
 impl Song {
     pub fn load(&mut self) {
+        println!("[song]: Loading song at {:?}", &self.path);
+
         //read the file as a whole
         self.bytes = Bytes::from(fs::read(&self.path).unwrap_or_default());
 
@@ -42,21 +38,17 @@ impl Song {
             self.coverart = Bytes::copy_from_slice(packet.data().unwrap_or_default());
         }
 
-        //we must get tags from the audio source
+        //get tags (metadata) and duration from the audio stream
         if let Some(stream) = fd.streams().best(Type::Audio) {
             self.tags =
-                HashMap::from_iter(stream.metadata().iter().map(|(k, v)| (k.into(), v.into())))
+                HashMap::from_iter(stream.metadata().iter().map(|(k, v)| (k.into(), v.into())));
+            self.duration =
+                (stream.duration() as f64 / stream.time_base().denominator() as f64).ceil() as i64
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
-    }
-
-    pub fn unload(&mut self) {
-        self.bytes.clear();
-        self.coverart.clear();
-        self.tags = HashMap::default();
     }
 
     pub fn coverart(&self) -> Bytes {
@@ -92,6 +84,10 @@ impl TryFrom<&walkdir::DirEntry> for Song {
     type Error = bool;
 
     fn try_from(dir: &walkdir::DirEntry) -> Result<Self, Self::Error> {
+        if dir.file_type().is_dir() {
+            return Err(false);
+        }
+
         let path = dir.path();
         let content_type = mime_guess::from_path(path);
 
@@ -99,19 +95,13 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             return Err(false);
         }
 
-        if dir.file_type().is_dir() {
+        let mimetype = if let Some(mt) = content_type.first()
+            && mt.type_() == "audio"
+        {
+            mt.to_owned()
+        } else {
             return Err(false);
-        }
-
-        let fd = input(path).expect(&format!("failed to open file at {:?}", &path));
-        let stream = match fd.streams().best(Type::Audio) {
-            Some(s) => s,
-            //no point going forward if we don't have audio track
-            _ => return Err(false),
         };
-
-        let duration =
-            (stream.duration() as f64 / stream.time_base().denominator() as f64).ceil() as i64;
 
         let hash = blake3::hash(path.as_os_str().as_bytes())
             .to_hex()
@@ -120,11 +110,11 @@ impl TryFrom<&walkdir::DirEntry> for Song {
         Ok(Self {
             id: hash,
             path: path.to_path_buf(),
-            duration,
+            duration: 0,
             bytes: Bytes::new(),
             coverart: Bytes::new(),
             tags: HashMap::default(),
-            content_type: content_type.first().expect("aa").to_string(),
+            content_type: mimetype.to_string(),
         })
     }
 }
