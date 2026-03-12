@@ -11,6 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -200,8 +201,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
                     println!("[ws]: Connection ended with an error {}", e);
                     break;
                 }
-                Some(Ok(_)) => (),
-                None => (),
+                _ => (),
             }
         }
     });
@@ -243,6 +243,21 @@ async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let playlist = spawn(Playlist::from(song_folder).run(state.clone(), shutdown.clone()));
 
+    let shutdown_ping = shutdown.clone();
+    let state_ping = state.clone();
+
+    let ping = spawn(async move {
+        loop {
+            if shutdown_ping.load(Ordering::Relaxed) {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            let _ = state_ping.broadcast.send(Message::Ping(Bytes::new()));
+        }
+    });
+
     let app = Router::new()
         .route("/version", get(version))
         .route("/stream", get(song2))
@@ -258,5 +273,5 @@ async fn main() {
     .unwrap();
     shutdown.store(true, Ordering::Relaxed);
 
-    let _ = try_join!(playlist);
+    let _ = try_join!(playlist, ping);
 }
