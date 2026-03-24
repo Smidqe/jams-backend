@@ -6,7 +6,6 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,7 +18,7 @@ use axum::{
     body::{Body, Bytes},
     debug_handler,
     extract::{
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{
@@ -31,8 +30,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use nanoid::nanoid;
+use scc::HashSet;
+use serde::Deserialize;
 
-use crate::{playlist::Playlist, song::Song};
+use crate::{
+    event::{Event, EventKind},
+    playlist::Playlist,
+    song::Song,
+};
 use anyhow::Result;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
@@ -55,12 +61,23 @@ impl Artwork {
     }
 
     pub fn get(&self) -> Bytes {
-        if let Some(bytes) = self.0.get() {
-            Bytes::copy_from_slice(bytes)
-        } else {
-            Bytes::new()
-        }
+        self.0
+            .get()
+            .map(|bytes| Bytes::copy_from_slice(bytes))
+            .unwrap_or_default()
     }
+}
+
+impl Default for Artwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Deserialize)]
+struct SongQuery {
+    id: String,
+    sid: String,
 }
 
 static DEFAULT_ARTWORK: Artwork = Artwork::new();
@@ -90,54 +107,60 @@ fn get_header_and_byte_ranges(
 }
 
 #[debug_handler]
-async fn song2(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn song2(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    query: Query<SongQuery>,
+) -> Response {
     let song = state.now.read();
     let mut response_headers = HeaderMap::new();
+    let mut response_code = StatusCode::OK;
 
     response_headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_str(song.get_content_type()).unwrap(),
     );
 
-    let (status, length, body) = if let Some(range) = headers.get(RANGE) {
-        let (header_range, byte_range) =
-            match get_header_and_byte_ranges(range, song.content_length()) {
-                Ok(s) => s,
-                Err(_) => return (StatusCode::BAD_REQUEST, HeaderMap::new(), Body::empty()),
-            };
+    //ensure request matches, and we have open session
+    if query.id != song.id() || !state.sessions.contains_sync(&query.sid) {
+        return (StatusCode::UNAUTHORIZED).into_response();
+    }
 
-        let slice = song.bytes_slice(byte_range);
+    //get the content and content length
+    //if invalid range was given we fallback to sending 200 and whole file
+    let (bytes, length) = match headers
+        .get(RANGE)
+        .and_then(|range| get_header_and_byte_ranges(range, song.content_length()).ok())
+    {
+        Some((header_range, content_range)) => {
+            response_code = StatusCode::PARTIAL_CONTENT;
+            response_headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!(
+                    "bytes {}-{}/{}",
+                    header_range.start,
+                    header_range.end,
+                    song.content_length()
+                ))
+                .unwrap(),
+            );
 
-        response_headers.insert(
-            CONTENT_RANGE,
-            HeaderValue::from_str(&format!(
-                "bytes {}-{}/{}",
-                header_range.start,
-                header_range.end,
-                song.content_length()
-            ))
-            .unwrap(),
-        );
-
-        (StatusCode::PARTIAL_CONTENT, slice.len(), Body::from(slice))
-    } else {
-        (
-            StatusCode::OK,
-            song.content_length(),
-            Body::from(song.bytes()),
-        )
+            song.bytes_slice_with_len(content_range)
+        }
+        None => song.bytes_slice_with_len(..),
     };
 
     response_headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
     response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 
-    (status, response_headers, body)
+    (response_code, response_headers, Body::from(bytes)).into_response()
 }
 
 #[debug_handler]
 async fn artwork(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let bytes = state.now.read().coverart();
+
     let body = if bytes.is_empty() {
         Body::from(DEFAULT_ARTWORK.get())
     } else {
@@ -156,6 +179,7 @@ struct AppState {
     now: Arc<RwLock<Song>>,
     broadcast: broadcast::Sender<Message>,
     playlist: Arc<RwLock<Vec<Song>>>,
+    sessions: Arc<scc::HashSet<String>>,
 }
 
 #[debug_handler]
@@ -168,40 +192,33 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
+    let id = nanoid!();
+    let events = vec![
+        Event::new_as_message(EventKind::SessionId, id.clone()),
+        Event::new_as_message(EventKind::Song, state.now.read().clone()),
+    ];
+
+    let _ = state.sessions.insert_async(id.clone()).await;
+
+    for ev in events {
+        if socket.send(ev).await.is_err() {
+            return;
+        }
+    }
+
     let (mut tx, mut rx) = socket.split();
     let mut listen = state.broadcast.subscribe();
 
     let mut sending = spawn(async move {
-        let msg = state.now.read().as_message();
-
-        if let Err(e) = tx.send(msg).await {
-            println!("{}", e)
-        }
-
-        loop {
-            let ev: Message = match listen.recv().await {
-                Ok(msg) => msg,
-                _ => continue,
-            };
-
-            if let Err(e) = tx.send(ev).await {
-                eprintln!("[ws]: Failed to broadcast a message: {}", e);
-            }
+        while let Ok(msg) = listen.recv().await {
+            let _ = tx.send(msg).await;
         }
     });
 
-    //if socket errors, break
     let mut receiving = spawn(async move {
-        loop {
-            match rx.next().await {
-                Some(Ok(Message::Close(_))) => {
-                    break;
-                }
-                Some(Err(e)) => {
-                    println!("[ws]: Connection ended with an error {}", e);
-                    break;
-                }
-                _ => (),
+        while let Some(Ok(msg)) = rx.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
             }
         }
     });
@@ -214,6 +231,8 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
             sending.abort();
         }
     }
+
+    state.sessions.remove_async(&id).await;
 }
 
 #[derive(Parser, Debug)]
@@ -238,6 +257,7 @@ async fn main() {
         now: Arc::new(RwLock::new(Song::default())),
         broadcast: tx,
         playlist: Arc::new(RwLock::new(Vec::new())),
+        sessions: Arc::new(HashSet::new()),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -248,13 +268,13 @@ async fn main() {
 
     let ping = spawn(async move {
         loop {
+            let _ = state_ping.broadcast.send(Message::Ping(Bytes::new()));
+
             if shutdown_ping.load(Ordering::Relaxed) {
                 break;
             }
 
             tokio::time::sleep(Duration::from_secs(10)).await;
-
-            let _ = state_ping.broadcast.send(Message::Ping(Bytes::new()));
         }
     });
 

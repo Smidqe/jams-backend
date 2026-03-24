@@ -55,12 +55,11 @@ impl Song {
         self.coverart.clone()
     }
 
-    pub fn bytes(&self) -> Bytes {
-        self.bytes.clone()
-    }
+    pub fn bytes_slice_with_len(&self, range: impl RangeBounds<usize>) -> (Bytes, usize) {
+        let slice = self.bytes.slice(range);
+        let len = slice.len();
 
-    pub fn bytes_slice(&self, range: impl RangeBounds<usize>) -> Bytes {
-        self.bytes.slice(range)
+        (slice, len)
     }
 
     pub fn content_length(&self) -> usize {
@@ -89,19 +88,14 @@ impl TryFrom<&walkdir::DirEntry> for Song {
         }
 
         let path = dir.path();
-        let content_type = mime_guess::from_path(path);
+        let mimetype: String = mime_guess::from_path(path)
+            .first()
+            .and_then(|mime| (mime.type_() == "audio").then_some(mime.to_string()))
+            .unwrap_or_default();
 
-        if content_type.is_empty() {
+        if mimetype == String::default() {
             return Err(false);
         }
-
-        let mimetype = if let Some(mt) = content_type.first()
-            && mt.type_() == "audio"
-        {
-            mt.to_owned()
-        } else {
-            return Err(false);
-        };
 
         let hash = blake3::hash(path.as_os_str().as_bytes())
             .to_hex()
@@ -114,7 +108,7 @@ impl TryFrom<&walkdir::DirEntry> for Song {
             bytes: Bytes::new(),
             coverart: Bytes::new(),
             tags: HashMap::default(),
-            content_type: mimetype.to_string(),
+            content_type: mimetype,
         })
     }
 }

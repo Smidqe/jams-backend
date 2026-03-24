@@ -5,6 +5,7 @@ use serde::Serialize;
 pub enum EventKind {
     Song,
     Sync,
+    SessionId,
 }
 
 #[derive(Clone, Serialize)]
@@ -29,13 +30,13 @@ where
     }
 }
 
-impl<T> Into<Message> for Event<T>
+impl<T> From<Event<T>> for Message
 where
     T: Serialize,
 {
-    fn into(self) -> Message {
+    fn from(val: Event<T>) -> Self {
         Message::Text(Utf8Bytes::from(
-            serde_json::to_string(&self).expect("this should never fail"),
+            serde_json::to_string(&val).expect("this should never fail"),
         ))
     }
 }
