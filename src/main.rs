@@ -1,22 +1,19 @@
 mod event;
 mod playlist;
+mod radio;
 mod song;
+mod state;
 
 use std::{
-    fs,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+    sync::{Arc, OnceLock},
 };
 
+use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::{Body, Bytes},
-    debug_handler,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -30,48 +27,32 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use clap::Parser;
+use futures::{SinkExt, StreamExt};
+use lofty::picture::Picture;
 use nanoid::nanoid;
-use scc::HashSet;
 use serde::Deserialize;
+use tokio::{
+    select, spawn,
+    sync::{broadcast, broadcast::error::RecvError, watch},
+    time::Instant,
+};
 
 use crate::{
     event::{Event, EventKind},
     playlist::Playlist,
-    song::Song,
+    radio::Radio,
+    song::image_content_type,
+    state::{AppState, NowPlaying, snapshot_msgs},
 };
-use anyhow::Result;
-use clap::Parser;
-use futures::{SinkExt, StreamExt};
-use http_range_header::{EndPosition, StartPosition};
-use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
-use tokio::{spawn, sync::broadcast, try_join};
 
-pub struct Artwork(OnceCell<Bytes>);
+static DEFAULT_ARTWORK: OnceLock<(Bytes, HeaderValue)> = OnceLock::new();
 
-impl Artwork {
-    pub const fn new() -> Artwork {
-        Artwork(OnceCell::new())
-    }
-
-    pub fn load_from_path(&self, path: &Path) {
-        self.0.get_or_init(|| {
-            Bytes::from(fs::read(path).expect("can't function without default artwork"))
-        });
-    }
-
-    pub fn get(&self) -> Bytes {
-        self.0
-            .get()
-            .map(|bytes| Bytes::copy_from_slice(bytes))
-            .unwrap_or_default()
-    }
-}
-
-impl Default for Artwork {
-    fn default() -> Self {
-        Self::new()
-    }
+fn load_default_artwork(path: &Path) -> (Bytes, HeaderValue) {
+    let bytes = std::fs::read(path).expect("can't function without default artwork");
+    let picture = Picture::from_reader(&mut bytes.as_slice())
+        .expect("default artwork must be a PNG, JPEG, TIFF, BMP or GIF");
+    (Bytes::from(bytes), image_content_type(picture.mime_type()))
 }
 
 #[derive(Deserialize)]
@@ -80,125 +61,113 @@ struct SongQuery {
     sid: String,
 }
 
-static DEFAULT_ARTWORK: Artwork = Artwork::new();
+#[derive(Deserialize)]
+struct ArtworkQuery {
+    id: String,
+}
 
-#[debug_handler]
 async fn version() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")])
 }
 
-fn get_header_and_byte_ranges(
-    range: &HeaderValue,
-    length: usize,
-) -> Result<(Range<u64>, Range<usize>)> {
-    let range = http_range_header::parse_range_header(range.to_str()?)?.ranges[0];
+/// TODO: This only considers first range, if multi range is given rest are ignored, probably not an issue though
+fn parse_range(header: &HeaderValue, len: usize) -> Option<Range<usize>> {
+    let v = http_range_header::parse_range_header(header.to_str().ok()?)
+        .ok()?
+        .validate(len as u64)
+        .ok()?;
+    let range = v.first()?;
 
-    match (range.start, range.end) {
-        //xxx-
-        (StartPosition::Index(start), EndPosition::LastByte) => {
-            Ok((start..(length - 1) as u64, (start as usize)..length))
-        }
-        //xxx-yyy
-        (StartPosition::Index(start), EndPosition::Index(end)) => {
-            Ok((start..end, start as usize..end as usize))
-        }
-        _ => unreachable!(),
-    }
+    //bytes is always +1 to end
+    Some(*range.start() as usize..*range.end() as usize + 1)
 }
 
-#[debug_handler]
-async fn song2(
+async fn stream(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    query: Query<SongQuery>,
+    Query(query): Query<SongQuery>,
 ) -> Response {
-    let song = state.now.read();
-    let mut response_headers = HeaderMap::new();
-    let mut response_code = StatusCode::OK;
-
-    response_headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_str(song.get_content_type()).unwrap(),
-    );
-
-    //ensure request matches, and we have open session
-    if query.id != song.id() || !state.sessions.contains_sync(&query.sid) {
-        return (StatusCode::UNAUTHORIZED).into_response();
+    if !state.sessions.contains_sync(&query.sid) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    //get the content and content length
-    //if invalid range was given we fallback to sending 200 and whole file
-    let (bytes, length) = match headers
-        .get(RANGE)
-        .and_then(|range| get_header_and_byte_ranges(range, song.content_length()).ok())
-    {
-        Some((header_range, content_range)) => {
-            response_code = StatusCode::PARTIAL_CONTENT;
-            response_headers.insert(
-                CONTENT_RANGE,
-                HeaderValue::from_str(&format!(
-                    "bytes {}-{}/{}",
-                    header_range.start,
-                    header_range.end,
-                    song.content_length()
-                ))
-                .unwrap(),
-            );
+    let state_copy = state.now_playing.load_full();
 
-            song.bytes_slice_with_len(content_range)
-        }
-        None => song.bytes_slice_with_len(..),
-    };
+    if !state_copy.is_current(&query.id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
-    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    let track = &state_copy.current;
+    let len = track.bytes.len();
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(track.content_type));
     response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 
-    (response_code, response_headers, Body::from(bytes)).into_response()
+    let (code, body) = match headers.get(RANGE) {
+        None => (StatusCode::OK, track.bytes.clone()),
+        Some(range_header) => match parse_range(range_header, len) {
+            Some(range) => {
+                response_headers.insert(
+                    CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", range.start, range.end - 1, len)
+                        .parse()
+                        .unwrap(),
+                );
+                (StatusCode::PARTIAL_CONTENT, track.bytes.slice(range))
+            }
+            None => {
+                response_headers.insert(CONTENT_RANGE, format!("bytes */{len}").parse().unwrap());
+                return (StatusCode::RANGE_NOT_SATISFIABLE, response_headers).into_response();
+            }
+        },
+    };
+    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    (code, response_headers, Body::from(body)).into_response()
 }
 
-#[debug_handler]
-async fn artwork(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let bytes = state.now.read().coverart();
-
-    let body = if bytes.is_empty() {
-        Body::from(DEFAULT_ARTWORK.get())
+async fn artwork(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ArtworkQuery>,
+) -> Response {
+    let now = state.now_playing.load();
+    if !now.is_current(&query.id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let track = &now.current;
+    let (body, content_type) = if track.art.is_empty() {
+        DEFAULT_ARTWORK
+            .get()
+            .cloned()
+            .expect("default artwork is loaded at startup")
     } else {
-        Body::from(bytes)
+        (track.art.clone(), track.art_type.clone())
     };
 
     (
-        StatusCode::OK,
-        [(CONTENT_TYPE, "application/octet-stream")],
+        [
+            (CONTENT_TYPE, content_type),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, immutable"),
+            ),
+        ],
         body,
     )
+        .into_response()
 }
 
-#[derive(Clone)]
-struct AppState {
-    now: Arc<RwLock<Song>>,
-    broadcast: broadcast::Sender<Message>,
-    playlist: Arc<RwLock<Vec<Song>>>,
-    sessions: Arc<scc::HashSet<String>>,
-}
-
-#[debug_handler]
-async fn ws_upgrader(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(|s| ws_handler(s, state))
+async fn ws_upgrader(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Response {
+    ws.on_upgrade(|s| ws_handler(s, st))
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
-    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
-        return;
-    }
-
+    let mut listen = state.broadcast.subscribe();
     let id = nanoid!();
-    let events = vec![
-        Event::new_as_message(EventKind::SessionId, id.clone()),
-        Event::new_as_message(EventKind::Song, state.now.read().clone()),
-    ];
 
-    let _ = state.sessions.insert_async(id.clone()).await;
+    let mut events = vec![Event::new_as_message(EventKind::SessionId, id.clone())];
+    events.extend(snapshot_msgs(&state.now_playing.load()));
 
     for ev in events {
         if socket.send(ev).await.is_err() {
@@ -206,12 +175,25 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    let _ = state.sessions.insert_async(id.clone()).await;
+
     let (mut tx, mut rx) = socket.split();
-    let mut listen = state.broadcast.subscribe();
+    let st2 = state.clone();
 
     let mut sending = spawn(async move {
-        while let Ok(msg) = listen.recv().await {
-            let _ = tx.send(msg).await;
+        loop {
+            let msgs = match listen.recv().await {
+                Ok(m) => vec![m],
+                // fell behind: resend a full snapshot instead of dropping the session
+                Err(RecvError::Lagged(_)) => snapshot_msgs(&st2.now_playing.load()),
+                Err(_) => return,
+            };
+
+            for m in msgs {
+                if tx.send(m).await.is_err() {
+                    return;
+                }
+            }
         }
     });
 
@@ -223,13 +205,9 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    tokio::select! {
-        _ = (&mut sending) => {
-            receiving.abort();
-        }
-        _ = (&mut receiving) => {
-            sending.abort();
-        }
+    select! {
+        _ = &mut sending => receiving.abort(),
+        _ = &mut receiving => sending.abort(),
     }
 
     state.sessions.remove_async(&id).await;
@@ -245,53 +223,46 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    ffmpeg_next::init().expect("eee");
-
     let args = Args::parse();
-    DEFAULT_ARTWORK.load_from_path(&PathBuf::from(args.artwork.as_str()));
+    let _ = DEFAULT_ARTWORK.set(load_default_artwork(Path::new(&args.artwork)));
 
-    let (tx, _) = broadcast::channel(1000);
-    let song_folder = PathBuf::from(args.source.as_str());
+    let root = PathBuf::from(&args.source);
+    let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
+        .await
+        .unwrap();
+    let first = Radio::get_loaded_track(&playlist)
+        .map(Arc::new)
+        .expect("can't load first track");
 
+    let started = Instant::now();
+    let (tx, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
-        now: Arc::new(RwLock::new(Song::default())),
+        now_playing: ArcSwap::from_pointee(NowPlaying {
+            current: first.clone(),
+            started,
+        }),
         broadcast: tx,
-        playlist: Arc::new(RwLock::new(Vec::new())),
-        sessions: Arc::new(HashSet::new()),
+        sessions: scc::HashSet::new(),
     });
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let playlist = spawn(Playlist::from(song_folder).run(state.clone(), shutdown.clone()));
-
-    let shutdown_ping = shutdown.clone();
-    let state_ping = state.clone();
-
-    let ping = spawn(async move {
-        loop {
-            let _ = state_ping.broadcast.send(Message::Ping(Bytes::new()));
-
-            if shutdown_ping.load(Ordering::Relaxed) {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
-    });
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let radio = spawn(Radio::new(playlist, first, started, state.clone()).run(stop_rx));
 
     let app = Router::new()
         .route("/version", get(version))
-        .route("/stream", get(song2))
+        .route("/stream", get(stream))
         .route("/ws", any(ws_upgrader))
         .route("/artwork", get(artwork))
         .with_state(state);
 
-    axum::serve(
-        tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap(),
-        app,
-    )
-    .await
-    .unwrap();
-    shutdown.store(true, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .unwrap();
 
-    let _ = try_join!(playlist, ping);
+    let _ = stop_tx.send(true);
+    let _ = radio.await;
 }

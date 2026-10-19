@@ -1,10 +1,11 @@
 services:
   jams:
     build: .
-    environment:
-      - MAX_PLAYLIST_SIZE=10
     ports:
-      - 8080:8080
+      - 9000:9000
     volumes:
-      - ./artwork:/artwork
-      - ${DIR_PATH_SONGS}:/songs
+      - ${DEFAULT_ARTWORK:-./artwork/artwork.png}:/artwork:ro
+      - ${DIR_PATH_SONGS}:/songs:ro
+    # The server shuts down gracefully on Ctrl-C (SIGINT) only
+    stop_signal: SIGINT
+    restart: unless-stopped
