@@ -175,8 +175,8 @@ fn read_tagged(reader: Cursor<Bytes>) -> anyhow::Result<(TaggedFile, Vec<(&'stat
     })
 }
 
-fn aliased_comments(tag: Option<&VorbisComments>) -> Vec<(&'static str, String)> {
-    tag.into_iter()
+fn aliased_comments(tags: Option<&VorbisComments>) -> Vec<(&'static str, String)> {
+    tags.into_iter()
         .flat_map(VorbisComments::items)
         .filter_map(|(k, v)| {
             let (_, to) = ALIASES

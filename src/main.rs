@@ -7,7 +7,7 @@ mod state;
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use arc_swap::ArcSwap;
@@ -43,10 +43,8 @@ use crate::{
     playlist::Playlist,
     radio::Radio,
     song::image_content_type,
-    state::{AppState, NowPlaying},
+    state::{AppState, CurrentSong},
 };
-
-static DEFAULT_ARTWORK: OnceLock<(Bytes, HeaderValue)> = OnceLock::new();
 
 fn load_default_artwork(path: &Path) -> (Bytes, HeaderValue) {
     let bytes = std::fs::read(path).expect("can't function without default artwork");
@@ -91,13 +89,13 @@ async fn stream(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let state_copy = state.now_playing.load_full();
+    let state_copy = state.current.load_full();
 
     if !state_copy.is_current(&query.id) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let track = &state_copy.current;
+    let track = &state_copy.track;
     let len = track.bytes.len();
 
     let mut response_headers = HeaderMap::new();
@@ -131,16 +129,13 @@ async fn artwork(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ArtworkQuery>,
 ) -> Response {
-    let now = state.now_playing.load();
+    let now = state.current.load();
     if !now.is_current(&query.id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let track = &now.current;
+    let track = &now.track;
     let (body, content_type) = if track.art.is_empty() {
-        DEFAULT_ARTWORK
-            .get()
-            .cloned()
-            .expect("default artwork is loaded at startup")
+        state.default_artwork.clone()
     } else {
         (track.art.clone(), track.art_type.clone())
     };
@@ -168,7 +163,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
 
     let events = vec![
         Event::SessionId(&id).into(),
-        Event::song(&state.now_playing.load()).into(),
+        Event::song(&state.current.load()).into(),
     ];
 
     for ev in events {
@@ -187,7 +182,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
             let msgs = match listen.recv().await {
                 Ok(m) => vec![m],
                 // fell behind: resend a full snapshot instead of dropping the session
-                Err(RecvError::Lagged(_)) => vec![Event::song(&st2.now_playing.load()).into()],
+                Err(RecvError::Lagged(_)) => vec![Event::song(&st2.current.load()).into()],
                 Err(_) => return,
             };
 
@@ -226,8 +221,6 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let _ = DEFAULT_ARTWORK.set(load_default_artwork(Path::new(&args.artwork)));
-
     let root = PathBuf::from(&args.source);
     let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
         .await
@@ -239,12 +232,13 @@ async fn main() {
     let started = Instant::now();
     let (tx, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
-        now_playing: ArcSwap::from_pointee(NowPlaying {
-            current: first.clone(),
+        current: ArcSwap::from_pointee(CurrentSong {
+            track: first.clone(),
             started,
         }),
         broadcast: tx,
         sessions: scc::HashSet::new(),
+        default_artwork: load_default_artwork(Path::new(&args.artwork)),
     });
 
     let (stop_tx, stop_rx) = watch::channel(false);

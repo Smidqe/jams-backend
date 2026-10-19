@@ -6,7 +6,7 @@ use std::{
 use axum::extract::ws::{Message, Utf8Bytes};
 use serde::Serialize;
 
-use crate::state::NowPlaying;
+use crate::state::CurrentSong;
 
 #[derive(Serialize)]
 pub struct SongEvent<'a> {
@@ -33,19 +33,19 @@ pub enum Event<'a> {
 }
 
 impl Event<'_> {
-    pub fn song(now: &NowPlaying) -> Event<'_> {
+    pub fn song(now: &CurrentSong) -> Event<'_> {
         Event::Song(SongEvent {
-            id: &now.current.id,
-            duration_ms: now.current.duration_ms,
-            tags: &now.current.tags,
+            id: &now.track.id,
+            duration_ms: now.track.duration_ms,
+            tags: &now.track.tags,
             position_ms: now.position_ms(),
             server_time_ms: unix_ms(),
         })
     }
 
-    pub fn sync(now: &NowPlaying) -> Event<'_> {
+    pub fn sync(now: &CurrentSong) -> Event<'_> {
         Event::Sync(SyncEvent {
-            id: &now.current.id,
+            id: &now.track.id,
             position_ms: now.position_ms(),
             server_time_ms: unix_ms(),
         })

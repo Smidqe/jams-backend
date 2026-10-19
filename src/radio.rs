@@ -2,7 +2,7 @@ use crate::{
     event::Event,
     playlist::Playlist,
     song::{self, Track},
-    state::{AppState, NowPlaying},
+    state::{AppState, CurrentSong},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -17,7 +17,7 @@ pub struct Radio {
     current: Arc<Track>,
     started: Instant,
     state: Arc<AppState>,
-    now: Arc<NowPlaying>,
+    now: Arc<CurrentSong>,
 }
 
 impl Radio {
@@ -27,8 +27,8 @@ impl Radio {
         started: Instant,
         state: Arc<AppState>,
     ) -> Self {
-        let now = Arc::new(NowPlaying {
-            current: current.clone(),
+        let now = Arc::new(CurrentSong {
+            track: current.clone(),
             started,
         });
 
@@ -42,12 +42,12 @@ impl Radio {
     }
 
     fn publish(&mut self) {
-        let s = Arc::new(NowPlaying {
-            current: self.current.clone(),
+        let s = Arc::new(CurrentSong {
+            track: self.current.clone(),
             started: self.started,
         });
 
-        self.state.now_playing.store(s.clone());
+        self.state.current.store(s.clone());
         self.now = s;
 
         let _ = self.state.broadcast.send(Event::song(&self.now).into());
