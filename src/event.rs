@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::extract::ws::{Message, Utf8Bytes};
 use serde::Serialize;
 
-use crate::state::{NowPlaying, unix_ms};
+use crate::state::NowPlaying;
 
 #[derive(Serialize)]
 pub struct SongEvent<'a> {
@@ -55,4 +58,11 @@ impl From<Event<'_>> for Message {
             serde_json::to_string(&event).expect("this should never fail"),
         ))
     }
+}
+
+pub fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }

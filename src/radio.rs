@@ -21,10 +21,6 @@ pub struct Radio {
 }
 
 impl Radio {
-    pub fn get_loaded_track(pl: &Playlist) -> anyhow::Result<Track> {
-        song::load(&pl.get_at_cursor())
-    }
-
     pub fn new(
         playlist: Playlist,
         current: Arc<Track>,
@@ -68,7 +64,9 @@ impl Radio {
             let preload = spawn_blocking(move || song::load(&next));
 
             let mut tick = interval_at(
+                //we start sync from 10s from now
                 Instant::now() + Duration::from_secs(10),
+                //at 10s intervals
                 Duration::from_secs(10),
             );
 

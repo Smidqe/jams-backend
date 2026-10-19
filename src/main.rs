@@ -232,7 +232,7 @@ async fn main() {
     let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
         .await
         .unwrap();
-    let first = Radio::get_loaded_track(&playlist)
+    let first = song::load(&playlist.get_at_cursor())
         .map(Arc::new)
         .expect("can't load first track");
 
