@@ -12,29 +12,30 @@ pub struct Playlist {
 
 impl Playlist {
     pub fn scan(root: &Path) -> Self {
-        let mut v: Vec<SongFile> = WalkDir::new(root)
+        let mut songs: Vec<SongFile> = WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
-            .filter_map(|e| {
-                let ct = content_type_for(e.path().extension()?.to_str()?)?;
-                let id = blake3::hash(e.path().as_os_str().as_bytes())
+            .filter_map(|entry| {
+                let content_type = content_type_for(entry.path().extension()?.to_str()?)?;
+                let id = blake3::hash(entry.path().as_os_str().as_bytes())
                     .to_hex()
                     .to_string();
                 Some(SongFile {
-                    path: e.into_path(),
+                    path: entry.into_path(),
                     id,
-                    content_type: ct,
+                    content_type,
                 })
             })
             .collect();
-        assert!(!v.is_empty(), "no songs found");
 
-        v.shuffle(&mut rand::rng());
-        println!("[playlist]: {} songs", v.len());
+        assert!(!songs.is_empty(), "no songs found");
+
+        songs.shuffle(&mut rand::rng());
+        println!("[playlist]: {} songs", songs.len());
 
         Self {
-            list: v.into(),
+            list: songs.into(),
             cursor: 0,
         }
     }

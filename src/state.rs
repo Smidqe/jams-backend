@@ -1,12 +1,7 @@
-use crate::{
-    event::{Event, EventKind},
-    song::Track,
-};
+use crate::song::Track;
 use arc_swap::ArcSwap;
 use axum::extract::ws::Message;
-use serde::Serialize;
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -38,40 +33,4 @@ pub fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
-}
-
-#[derive(Serialize)]
-struct SongEvent<'a> {
-    id: &'a str,
-    duration_ms: u128,
-    tags: &'a HashMap<String, String>,
-    position_ms: u64,
-    server_time_ms: u128,
-}
-
-#[derive(Serialize)]
-pub struct SyncEvent<'a> {
-    pub id: &'a str,
-    pub position_ms: u64,
-    pub server_time_ms: u128,
-}
-
-pub fn song_msg(song: &NowPlaying) -> Message {
-    let (now, pos) = (unix_ms(), song.position_ms());
-
-    Event::new_as_message(
-        EventKind::Song,
-        SongEvent {
-            id: &song.current.id,
-            duration_ms: song.current.duration_ms,
-            tags: &song.current.tags,
-            position_ms: pos,
-            server_time_ms: now,
-        },
-    )
-}
-
-/// Everything a joining (or lagged) client needs to be fully in sync.
-pub fn snapshot_msgs(s: &NowPlaying) -> Vec<Message> {
-    vec![song_msg(s)]
 }

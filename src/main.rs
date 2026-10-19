@@ -39,11 +39,11 @@ use tokio::{
 };
 
 use crate::{
-    event::{Event, EventKind},
+    event::Event,
     playlist::Playlist,
     radio::Radio,
     song::image_content_type,
-    state::{AppState, NowPlaying, snapshot_msgs},
+    state::{AppState, NowPlaying},
 };
 
 static DEFAULT_ARTWORK: OnceLock<(Bytes, HeaderValue)> = OnceLock::new();
@@ -166,8 +166,10 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let mut listen = state.broadcast.subscribe();
     let id = nanoid!();
 
-    let mut events = vec![Event::new_as_message(EventKind::SessionId, id.clone())];
-    events.extend(snapshot_msgs(&state.now_playing.load()));
+    let events = vec![
+        Event::SessionId(&id).into(),
+        Event::song(&state.now_playing.load()).into(),
+    ];
 
     for ev in events {
         if socket.send(ev).await.is_err() {
@@ -185,7 +187,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
             let msgs = match listen.recv().await {
                 Ok(m) => vec![m],
                 // fell behind: resend a full snapshot instead of dropping the session
-                Err(RecvError::Lagged(_)) => snapshot_msgs(&st2.now_playing.load()),
+                Err(RecvError::Lagged(_)) => vec![Event::song(&st2.now_playing.load()).into()],
                 Err(_) => return,
             };
 

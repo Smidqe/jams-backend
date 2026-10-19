@@ -1,8 +1,8 @@
 use crate::{
-    event::{Event, EventKind},
+    event::Event,
     playlist::Playlist,
     song::{self, Track},
-    state::{AppState, NowPlaying, SyncEvent, song_msg, unix_ms},
+    state::{AppState, NowPlaying},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -17,6 +17,7 @@ pub struct Radio {
     current: Arc<Track>,
     started: Instant,
     state: Arc<AppState>,
+    now: Arc<NowPlaying>,
 }
 
 impl Radio {
@@ -30,23 +31,30 @@ impl Radio {
         started: Instant,
         state: Arc<AppState>,
     ) -> Self {
+        let now = Arc::new(NowPlaying {
+            current: current.clone(),
+            started,
+        });
+
         Self {
             playlist,
             current,
             started,
             state,
+            now,
         }
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
         let s = Arc::new(NowPlaying {
             current: self.current.clone(),
             started: self.started,
         });
 
         self.state.now_playing.store(s.clone());
+        self.now = s;
 
-        let _ = self.state.broadcast.send(song_msg(&s));
+        let _ = self.state.broadcast.send(Event::song(&self.now).into());
     }
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
@@ -68,14 +76,7 @@ impl Radio {
                 select! {
                     _ = sleep_until(end) => break,
                     _ = tick.tick() => {
-                        let _ = self.state.broadcast.send(Event::new_as_message(
-                            EventKind::Sync,
-                            SyncEvent {
-                                id: &self.current.id,
-                                position_ms: self.started.elapsed().as_millis() as u64,
-                                server_time_ms: unix_ms(),
-                            },
-                        ));
+                        let _ = self.state.broadcast.send(Event::sync(&self.now).into());
                     }
                     _ = shutdown.changed() => return,
                 }
