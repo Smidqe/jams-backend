@@ -89,13 +89,13 @@ async fn stream(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let state_copy = state.current.load_full();
+    let now = state.current.load_full();
 
-    if !state_copy.is_current(&query.id) {
+    if !now.is_current(&query.id) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let track = &state_copy.track;
+    let track = &now.track;
     let len = track.bytes.len();
 
     let mut response_headers = HeaderMap::new();

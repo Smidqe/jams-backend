@@ -86,7 +86,7 @@ impl Radio {
                 Err(e) => eprintln!("[radio]: loader panicked, replaying current: {e}"),
             }
 
-            self.started = end; // exact boundary, no drift
+            self.started = end;
         }
     }
 }
