@@ -1,42 +1,68 @@
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use axum::extract::ws::{Message, Utf8Bytes};
 use serde::Serialize;
 
-#[derive(Clone, Serialize, Copy)]
-pub enum EventKind {
-    Song,
-    Sync,
-    SessionId,
+use crate::state::CurrentSong;
+
+#[derive(Serialize)]
+pub struct SongEvent<'a> {
+    pub id: &'a str,
+    pub duration_ms: u128,
+    pub tags: &'a HashMap<String, String>,
+    pub position_ms: u64,
+    pub server_time_ms: u128,
 }
 
-#[derive(Clone, Serialize)]
-pub struct Event<T>
-where
-    T: Serialize,
-{
-    pub kind: EventKind,
-    pub payload: T,
+#[derive(Serialize)]
+pub struct SyncEvent<'a> {
+    pub id: &'a str,
+    pub position_ms: u64,
+    pub server_time_ms: u128,
 }
 
-impl<T> Event<T>
-where
-    T: Serialize,
-{
-    pub fn new(kind: EventKind, payload: T) -> Event<T> {
-        Event { kind, payload }
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "payload")]
+pub enum Event<'a> {
+    SessionId(&'a str),
+    Song(SongEvent<'a>),
+    Sync(SyncEvent<'a>),
+}
+
+impl Event<'_> {
+    pub fn song(now: &CurrentSong) -> Event<'_> {
+        Event::Song(SongEvent {
+            id: &now.track.id,
+            duration_ms: now.track.duration_ms,
+            tags: &now.track.tags,
+            position_ms: now.position_ms(),
+            server_time_ms: unix_ms(),
+        })
     }
 
-    pub fn new_as_message(kind: EventKind, payload: T) -> Message {
-        Event::new(kind, payload).into()
+    pub fn sync(now: &CurrentSong) -> Event<'_> {
+        Event::Sync(SyncEvent {
+            id: &now.track.id,
+            position_ms: now.position_ms(),
+            server_time_ms: unix_ms(),
+        })
     }
 }
 
-impl<T> From<Event<T>> for Message
-where
-    T: Serialize,
-{
-    fn from(val: Event<T>) -> Self {
+impl From<Event<'_>> for Message {
+    fn from(event: Event<'_>) -> Self {
         Message::Text(Utf8Bytes::from(
-            serde_json::to_string(&val).expect("this should never fail"),
+            serde_json::to_string(&event).expect("this should never fail"),
         ))
     }
+}
+
+pub fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
