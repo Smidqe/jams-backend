@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use rand::seq::SliceRandom;
 use walkdir::WalkDir;
@@ -6,8 +6,8 @@ use walkdir::WalkDir;
 use crate::song::SongFile;
 
 pub struct Playlist {
-    pub list: Arc<[SongFile]>,
-    pub cursor: usize,
+    list: Box<[SongFile]>,
+    cursor: usize,
 }
 
 impl Playlist {
@@ -25,7 +25,7 @@ impl Playlist {
         println!("[playlist]: {} songs", songs.len());
 
         Self {
-            list: songs.into(),
+            list: songs.into_boxed_slice(),
             cursor: 0,
         }
     }

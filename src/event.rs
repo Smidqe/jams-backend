@@ -8,20 +8,20 @@ use serde::Serialize;
 
 use crate::state::CurrentSong;
 
+/// A `Sync` plus what the client needs to show the song.
 #[derive(Serialize)]
 pub struct SongEvent<'a> {
-    pub id: &'a str,
-    pub duration_ms: u128,
+    #[serde(flatten)]
+    pub sync: SyncEvent<'a>,
+    pub duration_ms: u64,
     pub tags: &'a HashMap<String, String>,
-    pub position_ms: u64,
-    pub server_time_ms: u128,
 }
 
 #[derive(Serialize)]
 pub struct SyncEvent<'a> {
     pub id: &'a str,
     pub position_ms: u64,
-    pub server_time_ms: u128,
+    pub server_time_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -35,20 +35,24 @@ pub enum Event<'a> {
 impl Event<'_> {
     pub fn song(now: &CurrentSong) -> Event<'_> {
         Event::Song(SongEvent {
-            id: &now.track.id,
+            sync: SyncEvent::new(now),
             duration_ms: now.track.duration_ms,
             tags: &now.track.tags,
-            position_ms: now.position_ms(),
-            server_time_ms: unix_ms(),
         })
     }
 
     pub fn sync(now: &CurrentSong) -> Event<'_> {
-        Event::Sync(SyncEvent {
+        Event::Sync(SyncEvent::new(now))
+    }
+}
+
+impl SyncEvent<'_> {
+    fn new(now: &CurrentSong) -> SyncEvent<'_> {
+        SyncEvent {
             id: &now.track.id,
             position_ms: now.position_ms(),
             server_time_ms: unix_ms(),
-        })
+        }
     }
 }
 
@@ -60,9 +64,9 @@ impl From<Event<'_>> for Message {
     }
 }
 
-pub fn unix_ms() -> u128 {
+pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
+        .expect("system clock is after 1970")
+        .as_millis() as u64
 }

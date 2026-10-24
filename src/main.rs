@@ -7,10 +7,9 @@ mod state;
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
-use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -21,7 +20,8 @@ use axum::{
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
-            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+            IF_NONE_MATCH, IF_RANGE, RANGE,
         },
     },
     response::{IntoResponse, Response},
@@ -79,12 +79,23 @@ fn parse_range(header: &HeaderValue, len: usize) -> Option<Range<usize>> {
     Some(*range.start() as usize..*range.end() as usize + 1)
 }
 
+/// Whether an `If-None-Match` header names `etag`, or is `*`.
+fn etag_matches(header: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = header.and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    value
+        .split(',')
+        .map(|tag| tag.trim().trim_start_matches("W/"))
+        .any(|tag| tag == etag || tag == "*")
+}
+
 async fn stream(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<SongQuery>,
 ) -> Response {
-    if !state.sessions.lock().unwrap().contains(&query.sid) {
+    if !state.has_session(&query.sid) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -97,31 +108,43 @@ async fn stream(
     let track = &now.track;
     let len = track.bytes.len();
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(track.content_type));
-    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // The length changes the tag too, in case a file is ever replaced in place
+    let etag = format!("\"{}-{len}\"", track.id);
+    if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
+        return (StatusCode::NOT_MODIFIED, [(ETAG, etag)]).into_response();
+    }
 
-    let (code, body) = match headers.get(RANGE) {
-        None => (StatusCode::OK, track.bytes.clone()),
-        Some(range_header) => match parse_range(range_header, len) {
-            Some(range) => {
-                response_headers.insert(
-                    CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", range.start, range.end - 1, len)
-                        .parse()
-                        .unwrap(),
-                );
-                (StatusCode::PARTIAL_CONTENT, track.bytes.slice(range))
-            }
-            None => {
-                response_headers.insert(CONTENT_RANGE, format!("bytes */{len}").parse().unwrap());
-                return (StatusCode::RANGE_NOT_SATISFIABLE, response_headers).into_response();
-            }
-        },
+    // A range of an older version of the file isn't a range of this one
+    let range_header = match headers.get(IF_RANGE) {
+        Some(if_range) if if_range.as_bytes() != etag.as_bytes() => None,
+        _ => headers.get(RANGE),
     };
-    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
-    (code, response_headers, Body::from(body)).into_response()
+
+    // No Range header means the whole file; an invalid one is answered right away
+    let (code, range) = match range_header.map(|h| parse_range(h, len)) {
+        None => (StatusCode::OK, 0..len),
+        Some(Some(range)) => (StatusCode::PARTIAL_CONTENT, range),
+        Some(None) => {
+            let unsatisfied = [(CONTENT_RANGE, format!("bytes */{len}"))];
+            return (StatusCode::RANGE_NOT_SATISFIABLE, unsatisfied).into_response();
+        }
+    };
+
+    let mut response = Response::builder()
+        .status(code)
+        .header(CONTENT_TYPE, track.content_type)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CACHE_CONTROL, "no-cache")
+        .header(ETAG, &etag)
+        .header(CONTENT_LENGTH, range.len());
+    if code == StatusCode::PARTIAL_CONTENT {
+        let content_range = format!("bytes {}-{}/{len}", range.start, range.end - 1);
+        response = response.header(CONTENT_RANGE, content_range);
+    }
+
+    response
+        .body(Body::from(track.bytes.slice(range)))
+        .expect("headers are all valid")
 }
 
 async fn artwork(
@@ -132,12 +155,11 @@ async fn artwork(
     if !now.is_current(&query.id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let track = &now.track;
-    let (body, content_type) = if track.art.is_empty() {
-        state.default_artwork.clone()
-    } else {
-        (track.art.clone(), track.art_type.clone())
-    };
+    let (body, content_type) = now
+        .track
+        .art
+        .clone()
+        .unwrap_or_else(|| state.default_artwork.clone());
 
     (
         [
@@ -152,18 +174,15 @@ async fn artwork(
         .into_response()
 }
 
-async fn ws_upgrader(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(|s| ws_handler(s, st))
-}
-
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let listen = state.broadcast.subscribe(); // subscribe before snapshotting
     let id = session_id();
 
     // Registered before the client learns the id, so /stream accepts it right away
-    state.sessions.lock().unwrap().insert(id.clone());
-    serve_session(&mut socket, &state, &id, listen).await;
-    state.sessions.lock().unwrap().remove(&id);
+    state.add_session(id.clone());
+    // Every way out of the session (closed, error, server shutdown) ends here
+    let _ = serve_session(&mut socket, &state, &id, listen).await;
+    state.remove_session(&id);
 }
 
 async fn serve_session(
@@ -171,16 +190,10 @@ async fn serve_session(
     state: &AppState,
     id: &str,
     mut listen: broadcast::Receiver<Message>,
-) {
-    let first: [Message; 2] = [
-        Event::SessionId(id).into(),
-        Event::song(&state.current.load()).into(),
-    ];
-    for msg in first {
-        if socket.send(msg).await.is_err() {
-            return;
-        }
-    }
+) -> Result<(), axum::Error> {
+    socket.send(Event::SessionId(id).into()).await?;
+    let song: Message = Event::song(&state.current.load()).into();
+    socket.send(song).await?;
 
     loop {
         let msg = select! {
@@ -188,17 +201,15 @@ async fn serve_session(
                 Ok(msg) => msg,
                 // fell behind: resend a full snapshot instead of dropping the session
                 Err(RecvError::Lagged(_)) => Event::song(&state.current.load()).into(),
-                Err(RecvError::Closed) => return,
+                Err(RecvError::Closed) => return Ok(()),
             },
-            incoming = socket.recv() => match incoming {
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
-                Some(Ok(_)) => continue, // clients don't send anything meaningful
+            incoming = socket.recv() => match incoming.transpose()? {
+                Some(Message::Close(_)) | None => return Ok(()),
+                Some(_) => continue, // clients don't send anything meaningful
             },
         };
 
-        if socket.send(msg).await.is_err() {
-            return;
-        }
+        socket.send(msg).await?;
     }
 }
 
@@ -225,41 +236,51 @@ async fn main() {
     let root = PathBuf::from(&args.source);
     let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
         .await
-        .unwrap();
+        .expect("playlist scan panicked");
     let first = song::load(&playlist.get_at_cursor())
         .map(Arc::new)
         .expect("can't load first track");
 
     let now = Arc::new(CurrentSong {
         started: Instant::now(),
-        track: first.clone(),
+        track: first,
     });
 
     let (tx, _) = broadcast::channel(64);
-    let state = Arc::new(AppState {
-        current: ArcSwap::new(now.clone()),
-        broadcast: tx,
-        sessions: Mutex::default(),
-        default_artwork: load_default_artwork(Path::new(&args.artwork)),
-    });
+    let default_artwork = load_default_artwork(Path::new(&args.artwork));
+    let state = Arc::new(AppState::new(now.clone(), tx, default_artwork));
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let radio = spawn(Radio::new(playlist, state.clone(), now).run(stop_rx));
+    let radio = Radio {
+        playlist,
+        state: state.clone(),
+        now,
+    };
+    let radio = spawn(radio.run(stop_rx));
 
     let app = Router::new()
         .route("/version", get(version))
         .route("/stream", get(stream))
-        .route("/ws", any(ws_upgrader))
+        .route(
+            "/ws",
+            any(
+                |ws: WebSocketUpgrade, State(state): State<Arc<AppState>>| async move {
+                    ws.on_upgrade(|socket| ws_handler(socket, state))
+                },
+            ),
+        )
         .route("/artwork", get(artwork))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000")
+        .await
+        .expect("can't listen on 0.0.0.0:9000, is the port in use?");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .unwrap();
+        .expect("server failed");
 
     let _ = stop_tx.send(true);
     let _ = radio.await;
