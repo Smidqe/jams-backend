@@ -1,9 +1,9 @@
-use std::{os::unix::ffi::OsStrExt, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use rand::seq::SliceRandom;
 use walkdir::WalkDir;
 
-use crate::song::{SongFile, content_type_for};
+use crate::song::SongFile;
 
 pub struct Playlist {
     pub list: Arc<[SongFile]>,
@@ -16,17 +16,7 @@ impl Playlist {
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
-            .filter_map(|entry| {
-                let content_type = content_type_for(entry.path().extension()?.to_str()?)?;
-                let id = blake3::hash(entry.path().as_os_str().as_bytes())
-                    .to_hex()
-                    .to_string();
-                Some(SongFile {
-                    path: entry.into_path(),
-                    id,
-                    content_type,
-                })
-            })
+            .filter_map(|entry| SongFile::from_path(entry.into_path()))
             .collect();
 
         assert!(!songs.is_empty(), "no songs found");

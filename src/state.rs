@@ -1,7 +1,10 @@
 use crate::song::Track;
 use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::ws::Message, http::HeaderValue};
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 use tokio::{sync::broadcast, time::Instant};
 
 pub struct CurrentSong {
@@ -22,6 +25,7 @@ impl CurrentSong {
 pub struct AppState {
     pub current: ArcSwap<CurrentSong>,
     pub broadcast: broadcast::Sender<Message>,
-    pub sessions: scc::HashSet<String>,
+    /// Never held across an `.await`, so a std mutex is fine.
+    pub sessions: Mutex<HashSet<String>>,
     pub default_artwork: (Bytes, HeaderValue),
 }

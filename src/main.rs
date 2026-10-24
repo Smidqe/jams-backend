@@ -7,7 +7,7 @@ mod state;
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use arc_swap::ArcSwap;
@@ -28,9 +28,8 @@ use axum::{
     routing::{any, get},
 };
 use clap::Parser;
-use futures::{SinkExt, StreamExt};
 use lofty::picture::Picture;
-use nanoid::nanoid;
+use rand::{Rng, distr::Alphanumeric};
 use serde::Deserialize;
 use tokio::{
     select, spawn,
@@ -85,7 +84,7 @@ async fn stream(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SongQuery>,
 ) -> Response {
-    if !state.sessions.contains_sync(&query.sid) {
+    if !state.sessions.lock().unwrap().contains(&query.sid) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -158,56 +157,58 @@ async fn ws_upgrader(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> R
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
-    let mut listen = state.broadcast.subscribe();
-    let id = nanoid!();
+    let listen = state.broadcast.subscribe(); // subscribe before snapshotting
+    let id = session_id();
 
-    let events = vec![
-        Event::SessionId(&id).into(),
+    // Registered before the client learns the id, so /stream accepts it right away
+    state.sessions.lock().unwrap().insert(id.clone());
+    serve_session(&mut socket, &state, &id, listen).await;
+    state.sessions.lock().unwrap().remove(&id);
+}
+
+async fn serve_session(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &str,
+    mut listen: broadcast::Receiver<Message>,
+) {
+    let first: [Message; 2] = [
+        Event::SessionId(id).into(),
         Event::song(&state.current.load()).into(),
     ];
-
-    for ev in events {
-        if socket.send(ev).await.is_err() {
+    for msg in first {
+        if socket.send(msg).await.is_err() {
             return;
         }
     }
 
-    let _ = state.sessions.insert_async(id.clone()).await;
-
-    let (mut tx, mut rx) = socket.split();
-    let st2 = state.clone();
-
-    let mut sending = spawn(async move {
-        loop {
-            let msgs = match listen.recv().await {
-                Ok(m) => vec![m],
+    loop {
+        let msg = select! {
+            received = listen.recv() => match received {
+                Ok(msg) => msg,
                 // fell behind: resend a full snapshot instead of dropping the session
-                Err(RecvError::Lagged(_)) => vec![Event::song(&st2.current.load()).into()],
-                Err(_) => return,
-            };
+                Err(RecvError::Lagged(_)) => Event::song(&state.current.load()).into(),
+                Err(RecvError::Closed) => return,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(_)) => continue, // clients don't send anything meaningful
+            },
+        };
 
-            for m in msgs {
-                if tx.send(m).await.is_err() {
-                    return;
-                }
-            }
+        if socket.send(msg).await.is_err() {
+            return;
         }
-    });
-
-    let mut receiving = spawn(async move {
-        while let Some(Ok(msg)) = rx.next().await {
-            if matches!(msg, Message::Close(_)) {
-                break;
-            }
-        }
-    });
-
-    select! {
-        _ = &mut sending => receiving.abort(),
-        _ = &mut receiving => sending.abort(),
     }
+}
 
-    state.sessions.remove_async(&id).await;
+/// 21 random alphanumeric characters from a cryptographically secure RNG.
+fn session_id() -> String {
+    rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(21)
+        .map(char::from)
+        .collect()
 }
 
 #[derive(Parser, Debug)]
@@ -229,20 +230,21 @@ async fn main() {
         .map(Arc::new)
         .expect("can't load first track");
 
-    let started = Instant::now();
+    let now = Arc::new(CurrentSong {
+        started: Instant::now(),
+        track: first.clone(),
+    });
+
     let (tx, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
-        current: ArcSwap::from_pointee(CurrentSong {
-            track: first.clone(),
-            started,
-        }),
+        current: ArcSwap::new(now.clone()),
         broadcast: tx,
-        sessions: scc::HashSet::new(),
+        sessions: Mutex::default(),
         default_artwork: load_default_artwork(Path::new(&args.artwork)),
     });
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let radio = spawn(Radio::new(playlist, first, started, state.clone()).run(stop_rx));
+    let radio = spawn(Radio::new(playlist, state.clone(), now).run(stop_rx));
 
     let app = Router::new()
         .route("/version", get(version))

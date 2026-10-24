@@ -10,13 +10,36 @@ use lofty::{
     tag::TagType,
 };
 use std::io::Cursor;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone)]
 pub struct SongFile {
     pub path: PathBuf,
-    pub id: String, // blake3 of path
+    pub id: String,
     pub content_type: &'static str,
+}
+
+impl SongFile {
+    /// `None` for files that aren't a supported audio format.
+    pub fn from_path(path: PathBuf) -> Option<Self> {
+        let content_type = content_type_for(path.extension()?.to_str()?)?;
+
+        // Same path gives the same id on every run of the same binary
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let id = format!("{:016x}", hasher.finish());
+
+        Some(Self {
+            path,
+            id,
+            content_type,
+        })
+    }
 }
 
 /// Fully loaded track. Lives behind an Arc, so clones are free.
@@ -30,7 +53,7 @@ pub struct Track {
     pub duration_ms: u128,
 }
 
-pub fn content_type_for(ext: &str) -> Option<&'static str> {
+fn content_type_for(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
         "opus" | "ogg" => Some("audio/ogg"),
         "mp3" => Some("audio/mpeg"),
@@ -134,8 +157,11 @@ pub fn load(e: &SongFile) -> anyhow::Result<Track> {
     }
 
     //duplicate tags will be ignored, probably not a problem \\shrug
-    for (k, v) in aliased {
-        tags.entry(k.to_owned()).or_insert(v);
+    for (k, v) in aliased.into_iter().chain(path_tags(&e.path)) {
+        let tag = tags.entry(k.to_owned()).or_default();
+        if tag.trim().is_empty() {
+            *tag = v;
+        }
     }
 
     let art_type = image_content_type(art_mime.as_ref());
@@ -151,25 +177,31 @@ pub fn load(e: &SongFile) -> anyhow::Result<Track> {
     })
 }
 
-fn read_tagged(reader: Cursor<Bytes>) -> anyhow::Result<(TaggedFile, Vec<(&'static str, String)>)> {
-    let probe = Probe::new(reader).guess_file_type()?;
+fn with_aliases<F: AudioFile + Into<TaggedFile>>(
+    reader: &mut Cursor<Bytes>,
+    options: ParseOptions,
+    comments: fn(&F) -> Option<&VorbisComments>,
+) -> anyhow::Result<(TaggedFile, Vec<(&'static str, String)>)> {
+    let f = F::read_from(reader, options)?;
+    let aliased = aliased_comments(comments(&f));
+    Ok((f.into(), aliased))
+}
+
+fn read_tagged(
+    mut reader: Cursor<Bytes>,
+) -> anyhow::Result<(TaggedFile, Vec<(&'static str, String)>)> {
+    let probe = Probe::new(reader.clone()).guess_file_type()?;
     let options = ParseOptions::new();
 
     Ok(match probe.file_type() {
         Some(FileType::Opus) => {
-            let f = OpusFile::read_from(&mut probe.into_inner(), options)?;
-            let aliased = aliased_comments(Some(f.vorbis_comments()));
-            (f.into(), aliased)
+            with_aliases::<OpusFile>(&mut reader, options, |f| Some(f.vorbis_comments()))?
         }
         Some(FileType::Vorbis) => {
-            let f = VorbisFile::read_from(&mut probe.into_inner(), options)?;
-            let aliased = aliased_comments(Some(f.vorbis_comments()));
-            (f.into(), aliased)
+            with_aliases::<VorbisFile>(&mut reader, options, |f| Some(f.vorbis_comments()))?
         }
         Some(FileType::Flac) => {
-            let f = FlacFile::read_from(&mut probe.into_inner(), options)?;
-            let aliased = aliased_comments(f.vorbis_comments());
-            (f.into(), aliased)
+            with_aliases::<FlacFile>(&mut reader, options, |f| f.vorbis_comments())?
         }
         _ => (probe.read()?, Vec::new()),
     })
@@ -185,4 +217,44 @@ fn aliased_comments(tags: Option<&VorbisComments>) -> Vec<(&'static str, String)
             Some((*to, v.to_owned()))
         })
         .collect()
+}
+
+/// Fallback tags from the library's folder layout, for files missing them:
+///
+/// * `Artists/<artist>/<file>`: artist
+/// * `Artists/<artist>/<album>/…/<file>`: artist and album
+/// * `Albums/<album>/<file>`: album
+/// * `Albums/<series>/<album>/<file>`: album as `<series> – <album>`
+pub fn path_tags(path: &Path) -> Vec<(&'static str, String)> {
+    let mut tags = Vec::new();
+    if let Some(stem) = path.file_stem() {
+        tags.push(("TITLE", stem.to_string_lossy().into_owned()));
+    }
+
+    let folders: Vec<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let Some(start) = folders
+        .iter()
+        .rposition(|f| f == "Artists" || f == "Albums")
+    else {
+        return tags;
+    };
+
+    match (folders[start].as_str(), &folders[start + 1..]) {
+        ("Artists", [artist, rest @ ..]) => {
+            tags.push(("ARTIST", artist.clone()));
+            if let Some(album) = rest.first() {
+                tags.push(("ALBUM", album.clone()));
+            }
+        }
+        ("Albums", [album]) => tags.push(("ALBUM", album.clone())),
+        ("Albums", [series, album, ..]) => tags.push(("ALBUM", format!("{series} – {album}"))),
+        _ => {}
+    }
+
+    tags
 }

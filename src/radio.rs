@@ -14,50 +14,30 @@ use tokio::{
 
 pub struct Radio {
     playlist: Playlist,
-    current: Arc<Track>,
-    started: Instant,
     state: Arc<AppState>,
     now: Arc<CurrentSong>,
 }
 
 impl Radio {
-    pub fn new(
-        playlist: Playlist,
-        current: Arc<Track>,
-        started: Instant,
-        state: Arc<AppState>,
-    ) -> Self {
-        let now = Arc::new(CurrentSong {
-            track: current.clone(),
-            started,
-        });
-
+    pub fn new(playlist: Playlist, state: Arc<AppState>, now: Arc<CurrentSong>) -> Self {
         Self {
             playlist,
-            current,
-            started,
             state,
             now,
         }
     }
 
-    fn publish(&mut self) {
-        let s = Arc::new(CurrentSong {
-            track: self.current.clone(),
-            started: self.started,
-        });
-
-        self.state.current.store(s.clone());
-        self.now = s;
+    fn publish(&mut self, track: Arc<Track>, started: Instant) {
+        self.now = Arc::new(CurrentSong { track, started });
+        self.state.current.store(self.now.clone());
 
         let _ = self.state.broadcast.send(Event::song(&self.now).into());
     }
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         loop {
-            let end = self.started + Duration::from_millis(self.current.duration_ms as u64);
+            let end = self.now.started + Duration::from_millis(self.now.track.duration_ms as u64);
 
-            self.publish();
             self.playlist.advance();
 
             let next = self.playlist.get_at_cursor();
@@ -80,13 +60,15 @@ impl Radio {
                 }
             }
 
-            match preload.await {
-                Ok(Ok(t)) => self.current = Arc::new(t),
-                Ok(Err(e)) => eprintln!("[radio]: failed to load track, replaying current: {e}"),
-                Err(e) => eprintln!("[radio]: loader panicked, replaying current: {e}"),
-            }
+            let track = match preload.await {
+                Ok(Ok(t)) => Arc::new(t),
+                Ok(Err(_)) | Err(_) => {
+                    eprintln!("[radio]: failed to load track, replaying current");
+                    self.now.track.clone()
+                }
+            };
 
-            self.started = end;
+            self.publish(track, end);
         }
     }
 }
