@@ -4,18 +4,28 @@ use lofty::{
     file::{FileType, TaggedFile},
     flac::FlacFile,
     ogg::{OpusFile, VorbisFile, tag::VorbisComments},
-    picture::MimeType,
+    picture::Picture,
     prelude::*,
     probe::Probe,
     tag::TagType,
 };
-use std::io::Cursor;
+use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
+    io::{BufReader, Cursor, Read, Seek},
     path::{Path, PathBuf},
 };
+
+/// Image bytes and their content type.
+pub type Image = (Bytes, HeaderValue);
+
+/// Tags by their Vorbis comment name.
+pub type Tags = HashMap<String, String>;
+
+/// Tags from outside the file's own tags (aliases, folder layout), used where it has none.
+type ExtraTags = Vec<(&'static str, String)>;
 
 #[derive(Clone)]
 pub struct SongFile {
@@ -49,10 +59,21 @@ pub struct Track {
     /// The file as served by `/stream`: the audio without its embedded tags and cover.
     pub bytes: Bytes,
     /// Embedded cover art and its content type, if the file has one.
-    pub art: Option<(Bytes, HeaderValue)>,
-    pub tags: HashMap<String, String>,
+    pub art: Option<Image>,
+    pub tags: Tags,
     pub duration_ms: u64,
 }
+
+/// A song in the upcoming list: just enough to show it.
+#[derive(Clone, Serialize)]
+pub struct Upcoming {
+    pub id: String,
+    pub duration_ms: u64,
+    /// Only `UPCOMING_TAGS`, and only the non-empty ones.
+    pub tags: Tags,
+}
+
+const UPCOMING_TAGS: &[&str] = &["TITLE", "ARTIST", "ALBUM"];
 
 fn content_type_for(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
@@ -63,9 +84,13 @@ fn content_type_for(ext: &str) -> Option<&'static str> {
     }
 }
 
-pub fn image_content_type(mime: Option<&MimeType>) -> HeaderValue {
-    mime.and_then(|m| HeaderValue::from_str(m.as_str()).ok())
-        .unwrap_or(HeaderValue::from_static("application/octet-stream"))
+/// The picture's bytes and content type.
+pub fn image(p: &Picture) -> Image {
+    let content_type = p
+        .mime_type()
+        .and_then(|m| HeaderValue::from_str(m.as_str()).ok())
+        .unwrap_or(HeaderValue::from_static("application/octet-stream"));
+    (Bytes::copy_from_slice(p.data()), content_type)
 }
 
 /// Embedded cover art can exceed lofty's default 16 MiB allocation limit.
@@ -127,16 +152,73 @@ const ALIASES: &[(&str, &str)] = &[
 ];
 
 pub fn load(e: &SongFile) -> anyhow::Result<Track> {
+    let bytes = Bytes::from(fs::read(&e.path)?);
+    let (file, tags, duration_ms) =
+        parse(Cursor::new(bytes.clone()), &e.path, ParseOptions::new())?;
+
+    // TODO: Shrink big covers (e.g. to at most 1000x1000 JPEG with the `image` crate).
+    // Some files embed 15 MB covers, and /artwork sends them in full to every listener.
+    let art = file
+        .tags()
+        .iter()
+        .find_map(|tag| tag.pictures().first())
+        .map(image);
+
+    Ok(Track {
+        id: e.id.clone(),
+        content_type: e.content_type,
+        bytes: without_metadata(&bytes, &file, &e.path),
+        art,
+        tags,
+        duration_ms,
+    })
+}
+
+/// Tags and duration for the upcoming list, read without the cover or keeping the
+/// file in memory. A file that can't be read gets its folder-layout tags and a zero
+/// duration, so the list keeps its place.
+pub fn peek(e: &SongFile) -> Upcoming {
+    let options = ParseOptions::new().read_cover_art(false);
+    let read = File::open(&e.path)
+        .map_err(anyhow::Error::from)
+        .and_then(|f| parse(BufReader::new(f), &e.path, options));
+
+    let (mut tags, duration_ms) = match read {
+        Ok((_, tags, duration_ms)) => (tags, duration_ms),
+        Err(err) => {
+            eprintln!("[song]: can't peek {}: {err}", e.path.display());
+            let tags = path_tags(&e.path)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect();
+            (tags, 0)
+        }
+    };
+    tags.retain(|k, v| UPCOMING_TAGS.contains(&k.as_str()) && !v.trim().is_empty());
+
+    Upcoming {
+        id: e.id.clone(),
+        duration_ms,
+        tags,
+    }
+}
+
+/// Reads the file and its tags: Vorbis comment names for every format, with
+/// missing ones filled from `ALIASES`, then the folder layout.
+fn parse<R: Read + Seek>(
+    reader: R,
+    path: &Path,
+    options: ParseOptions,
+) -> anyhow::Result<(TaggedFile, Tags, u64)> {
     // lofty fails with >16MB cover arts
     apply_global_options(GlobalOptions::new().allocation_limit(ALLOCATION_LIMIT));
 
-    let bytes = Bytes::from(fs::read(&e.path)?);
-    let (file, aliased) = read_tagged(Cursor::new(bytes.clone()))?;
+    let (file, aliased) = read_tagged(reader, options)?;
 
     let duration_ms = file.properties().duration().as_millis() as u64;
-    anyhow::ensure!(duration_ms > 0, "zero duration: {}", e.path.display());
+    anyhow::ensure!(duration_ms > 0, "zero duration: {}", path.display());
 
-    let (mut tags, mut art) = (HashMap::new(), None);
+    let mut tags = HashMap::new();
     for tag in file.tags() {
         for item in tag.items() {
             // Vorbis comment names for every format, so FE sees one set of keys
@@ -148,35 +230,17 @@ pub fn load(e: &SongFile) -> anyhow::Result<Track> {
                 tags.entry(k.to_owned()).or_insert_with(|| v.to_owned());
             }
         }
-
-        // TODO: Shrink big covers (e.g. to at most 1000x1000 JPEG with the `image` crate).
-        // Some files embed 15 MB covers, and /artwork sends them in full to every listener.
-        if art.is_none() {
-            art = tag.pictures().first().map(|p| {
-                (
-                    Bytes::copy_from_slice(p.data()),
-                    image_content_type(p.mime_type()),
-                )
-            });
-        }
     }
 
     // Aliases, then the folder layout, fill in tags the file is missing (or has empty)
-    for (k, v) in aliased.into_iter().chain(path_tags(&e.path)) {
+    for (k, v) in aliased.into_iter().chain(path_tags(path)) {
         let tag = tags.entry(k.to_owned()).or_default();
         if tag.trim().is_empty() {
             *tag = v;
         }
     }
 
-    Ok(Track {
-        id: e.id.clone(),
-        content_type: e.content_type,
-        bytes: without_metadata(&bytes, &file, &e.path),
-        art,
-        tags,
-        duration_ms,
-    })
+    Ok((file, tags, duration_ms))
 }
 
 /// The file with every embedded tag (and so the cover art) removed. Clients get
@@ -200,12 +264,12 @@ fn without_metadata(bytes: &Bytes, file: &TaggedFile, path: &Path) -> Bytes {
 
 /// Reads `F`, plus its raw Vorbis comments renamed through `ALIASES`, which
 /// the generic tag would drop.
-fn with_aliases<F: AudioFile + Into<TaggedFile>>(
-    reader: &mut Cursor<Bytes>,
+fn with_aliases<F: AudioFile + Into<TaggedFile>, R: Read + Seek>(
+    probe: Probe<R>,
     options: ParseOptions,
     comments: fn(&F) -> Option<&VorbisComments>,
-) -> anyhow::Result<(TaggedFile, Vec<(&'static str, String)>)> {
-    let f = F::read_from(reader, options)?;
+) -> anyhow::Result<(TaggedFile, ExtraTags)> {
+    let f = F::read_from(&mut probe.into_inner(), options)?;
     let aliased = comments(&f)
         .into_iter()
         .flat_map(VorbisComments::items)
@@ -219,24 +283,23 @@ fn with_aliases<F: AudioFile + Into<TaggedFile>>(
     Ok((f.into(), aliased))
 }
 
-fn read_tagged(
-    mut reader: Cursor<Bytes>,
-) -> anyhow::Result<(TaggedFile, Vec<(&'static str, String)>)> {
-    let probe = Probe::new(reader.clone()).guess_file_type()?;
-    let options = ParseOptions::new();
+fn read_tagged<R: Read + Seek>(
+    reader: R,
+    options: ParseOptions,
+) -> anyhow::Result<(TaggedFile, ExtraTags)> {
+    // Guessing leaves the reader where it started
+    let probe = Probe::new(reader).options(options).guess_file_type()?;
 
-    Ok(match probe.file_type() {
+    match probe.file_type() {
         Some(FileType::Opus) => {
-            with_aliases::<OpusFile>(&mut reader, options, |f| Some(f.vorbis_comments()))?
+            with_aliases(probe, options, |f: &OpusFile| Some(f.vorbis_comments()))
         }
         Some(FileType::Vorbis) => {
-            with_aliases::<VorbisFile>(&mut reader, options, |f| Some(f.vorbis_comments()))?
+            with_aliases(probe, options, |f: &VorbisFile| Some(f.vorbis_comments()))
         }
-        Some(FileType::Flac) => {
-            with_aliases::<FlacFile>(&mut reader, options, FlacFile::vorbis_comments)?
-        }
-        _ => (probe.read()?, Vec::new()),
-    })
+        Some(FileType::Flac) => with_aliases(probe, options, FlacFile::vorbis_comments),
+        _ => Ok((probe.read()?, Vec::new())),
+    }
 }
 
 /// Fallback tags from the library's folder layout, for files missing them:
@@ -245,7 +308,7 @@ fn read_tagged(
 /// * `Artists/<artist>/<album>/…/<file>`: artist and album
 /// * `Albums/<album>/<file>`: album
 /// * `Albums/<series>/<album>/<file>`: album as `<series> – <album>`
-pub fn path_tags(path: &Path) -> Vec<(&'static str, String)> {
+pub fn path_tags(path: &Path) -> ExtraTags {
     let mut tags = Vec::new();
     if let Some(stem) = path.file_stem() {
         tags.push(("TITLE", stem.to_string_lossy().into_owned()));
@@ -277,4 +340,34 @@ pub fn path_tags(path: &Path) -> Vec<(&'static str, String)> {
     }
 
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_matches_load() {
+        let e = SongFile::from_path("local_songs/galacontheme.opus".into()).unwrap();
+        let track = load(&e).unwrap();
+        let upcoming = peek(&e);
+
+        assert_eq!(upcoming.id, track.id);
+        assert_eq!(upcoming.duration_ms, track.duration_ms);
+        assert!(upcoming.tags.contains_key("TITLE"));
+        for (k, v) in &upcoming.tags {
+            assert_eq!(track.tags.get(k), Some(v), "{k}");
+        }
+    }
+
+    #[test]
+    fn peek_falls_back_to_path() {
+        let e = SongFile::from_path("Artists/Someone/Album/Song.opus".into()).unwrap();
+        let upcoming = peek(&e);
+
+        assert_eq!(upcoming.duration_ms, 0);
+        assert_eq!(upcoming.tags["TITLE"], "Song");
+        assert_eq!(upcoming.tags["ARTIST"], "Someone");
+        assert_eq!(upcoming.tags["ALBUM"], "Album");
+    }
 }

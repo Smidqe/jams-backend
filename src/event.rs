@@ -1,20 +1,21 @@
-use std::{
-    collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, Utf8Bytes};
 use serde::Serialize;
 
-use crate::state::CurrentSong;
+use crate::{
+    song::{Tags, Upcoming},
+    state::CurrentSong,
+};
 
-/// A `Sync` plus what the client needs to show the song.
+/// A `Sync` plus what the client needs to show the song and the ones after it.
 #[derive(Serialize)]
 pub struct SongEvent<'a> {
     #[serde(flatten)]
     pub sync: SyncEvent<'a>,
     pub duration_ms: u64,
-    pub tags: &'a HashMap<String, String>,
+    pub tags: &'a Tags,
+    pub upcoming: &'a [Upcoming],
 }
 
 #[derive(Serialize)]
@@ -38,6 +39,7 @@ impl Event<'_> {
             sync: SyncEvent::new(now),
             duration_ms: now.track.duration_ms,
             tags: &now.track.tags,
+            upcoming: &now.upcoming,
         })
     }
 

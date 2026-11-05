@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -34,22 +34,16 @@ use serde::Deserialize;
 use tokio::{
     select, spawn,
     sync::{broadcast, broadcast::error::RecvError, watch},
-    time::Instant,
+    task::spawn_blocking,
 };
 
-use crate::{
-    event::Event,
-    playlist::Playlist,
-    radio::Radio,
-    song::image_content_type,
-    state::{AppState, CurrentSong},
-};
+use crate::{event::Event, playlist::Playlist, radio::Radio, song::Image, state::AppState};
 
-fn load_default_artwork(path: &Path) -> (Bytes, HeaderValue) {
+fn load_default_artwork(path: &Path) -> Image {
     let bytes = std::fs::read(path).expect("can't function without default artwork");
     let picture = Picture::from_reader(&mut bytes.as_slice())
         .expect("default artwork must be a PNG, JPEG, TIFF, BMP or GIF");
-    (Bytes::from(bytes), image_content_type(picture.mime_type()))
+    song::image(&picture)
 }
 
 #[derive(Deserialize)]
@@ -81,13 +75,12 @@ fn parse_range(header: &HeaderValue, len: usize) -> Option<Range<usize>> {
 
 /// Whether an `If-None-Match` header names `etag`, or is `*`.
 fn etag_matches(header: Option<&HeaderValue>, etag: &str) -> bool {
-    let Some(value) = header.and_then(|h| h.to_str().ok()) else {
-        return false;
-    };
-    value
-        .split(',')
-        .map(|tag| tag.trim().trim_start_matches("W/"))
-        .any(|tag| tag == etag || tag == "*")
+    header.and_then(|h| h.to_str().ok()).is_some_and(|value| {
+        value
+            .split(',')
+            .map(|tag| tag.trim().trim_start_matches("W/"))
+            .any(|tag| tag == etag || tag == "*")
+    })
 }
 
 async fn stream(
@@ -99,16 +92,15 @@ async fn stream(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let now = state.current.load_full();
-
-    if !now.is_current(&query.id) {
+    let Some(now) = state.current_if(&query.id) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     let track = &now.track;
     let len = track.bytes.len();
 
     // The length changes the tag too, in case a file is ever replaced in place
+
     let etag = format!("\"{}-{len}\"", track.id);
     if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
         return (StatusCode::NOT_MODIFIED, [(ETAG, etag)]).into_response();
@@ -137,9 +129,12 @@ async fn stream(
         .header(CACHE_CONTROL, "no-cache")
         .header(ETAG, &etag)
         .header(CONTENT_LENGTH, range.len());
+
     if code == StatusCode::PARTIAL_CONTENT {
-        let content_range = format!("bytes {}-{}/{len}", range.start, range.end - 1);
-        response = response.header(CONTENT_RANGE, content_range);
+        response = response.header(
+            CONTENT_RANGE,
+            format!("bytes {}-{}/{len}", range.start, range.end - 1),
+        );
     }
 
     response
@@ -151,27 +146,18 @@ async fn artwork(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ArtworkQuery>,
 ) -> Response {
-    let now = state.current.load();
-    if !now.is_current(&query.id) {
+    let Some(now) = state.current_if(&query.id) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
+
     let (body, content_type) = now
         .track
         .art
         .clone()
         .unwrap_or_else(|| state.default_artwork.clone());
 
-    (
-        [
-            (CONTENT_TYPE, content_type),
-            (
-                CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, immutable"),
-            ),
-        ],
-        body,
-    )
-        .into_response()
+    let cache = HeaderValue::from_static("public, max-age=86400, immutable");
+    ([(CONTENT_TYPE, content_type), (CACHE_CONTROL, cache)], body).into_response()
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
@@ -192,8 +178,9 @@ async fn serve_session(
     mut listen: broadcast::Receiver<Message>,
 ) -> Result<(), axum::Error> {
     socket.send(Event::SessionId(id).into()).await?;
-    let song: Message = Event::song(&state.current.load()).into();
-    socket.send(song).await?;
+    socket
+        .send(Event::song(&state.current.load()).into())
+        .await?;
 
     loop {
         let msg = select! {
@@ -234,17 +221,13 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let root = PathBuf::from(&args.source);
-    let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
-        .await
-        .expect("playlist scan panicked");
-    let first = song::load(&playlist.get_at_cursor())
-        .map(Arc::new)
-        .expect("can't load first track");
-
-    let now = Arc::new(CurrentSong {
-        started: Instant::now(),
-        track: first,
-    });
+    let (playlist, now) = spawn_blocking(move || {
+        let playlist = Playlist::scan(&root);
+        let now = radio::first(&playlist).expect("can't load first track");
+        (playlist, Arc::new(now))
+    })
+    .await
+    .expect("startup panicked");
 
     let (tx, _) = broadcast::channel(64);
     let default_artwork = load_default_artwork(Path::new(&args.artwork));
@@ -275,6 +258,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9000")
         .await
         .expect("can't listen on 0.0.0.0:9000, is the port in use?");
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
