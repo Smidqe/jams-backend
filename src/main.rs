@@ -5,9 +5,10 @@ mod song;
 mod state;
 
 use std::{
-    ops::Range,
+    ops::{Bound, Range},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -17,19 +18,17 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{
-        HeaderMap, HeaderValue, StatusCode,
-        header::{
-            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-            IF_NONE_MATCH, IF_RANGE, RANGE,
-        },
-    },
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 use clap::Parser;
+use headers::{
+    AcceptRanges, CacheControl, ContentLength, ContentRange, ETag, HeaderMapExt, IfNoneMatch,
+    IfRange,
+};
 use lofty::picture::Picture;
-use rand::{Rng, distr::Alphanumeric};
+use nanoid::nanoid;
 use serde::Deserialize;
 use tokio::{
     select, spawn,
@@ -61,26 +60,21 @@ async fn version() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")])
 }
 
-/// TODO: This only considers first range, if multi range is given rest are ignored, probably not an issue though
-fn parse_range(header: &HeaderValue, len: usize) -> Option<Range<usize>> {
-    let v = http_range_header::parse_range_header(header.to_str().ok()?)
-        .ok()?
-        .validate(len as u64)
-        .ok()?;
-    let range = v.first()?;
-
-    //bytes is always +1 to end
-    Some(*range.start() as usize..*range.end() as usize + 1)
-}
-
-/// Whether an `If-None-Match` header names `etag`, or is `*`.
-fn etag_matches(header: Option<&HeaderValue>, etag: &str) -> bool {
-    header.and_then(|h| h.to_str().ok()).is_some_and(|value| {
-        value
-            .split(',')
-            .map(|tag| tag.trim().trim_start_matches("W/"))
-            .any(|tag| tag == etag || tag == "*")
-    })
+/// The first range of a `Range` header within a file of `len` bytes, or `None` if
+/// it can't be satisfied. Only the first is used; audio players ask for one at a time.
+/// `headers` doesn't check ranges against the length, so that's done here: an end
+/// past the file means "to the end", a start past it can't be served.
+fn first_range(header: &headers::Range, len: usize) -> Option<Range<usize>> {
+    let (start, end) = header.satisfiable_ranges(len as u64).next()?;
+    let start = match start {
+        Bound::Included(s) => s as usize,
+        _ => 0,
+    };
+    let end = match end {
+        Bound::Included(e) => (e as usize).saturating_add(1).min(len),
+        _ => len,
+    };
+    (start < end).then_some(start..end)
 }
 
 async fn stream(
@@ -100,46 +94,43 @@ async fn stream(
     let len = track.bytes.len();
 
     // The length changes the tag too, in case a file is ever replaced in place
+    let etag: ETag = format!("\"{}-{len}\"", track.id)
+        .parse()
+        .expect("ids are hex, so the tag is valid");
+    let mut out = HeaderMap::new();
+    out.typed_insert(etag.clone());
 
-    let etag = format!("\"{}-{len}\"", track.id);
-    if etag_matches(headers.get(IF_NONE_MATCH), &etag) {
-        return (StatusCode::NOT_MODIFIED, [(ETAG, etag)]).into_response();
+    let not_modified = headers.typed_get::<IfNoneMatch>();
+    if not_modified.is_some_and(|h| !h.precondition_passes(&etag)) {
+        return (StatusCode::NOT_MODIFIED, out).into_response();
     }
 
     // A range of an older version of the file isn't a range of this one
-    let range_header = match headers.get(IF_RANGE) {
-        Some(if_range) if if_range.as_bytes() != etag.as_bytes() => None,
-        _ => headers.get(RANGE),
+    let range = match headers.typed_get::<IfRange>() {
+        Some(if_range) if if_range.is_modified(Some(&etag), None) => None,
+        _ => headers.typed_get::<headers::Range>(),
     };
 
-    // No Range header means the whole file; an invalid one is answered right away
-    let (code, range) = match range_header.map(|h| parse_range(h, len)) {
+    // No Range header means the whole file; an unsatisfiable one is answered right away
+    let (code, range) = match range.map(|r| first_range(&r, len)) {
         None => (StatusCode::OK, 0..len),
         Some(Some(range)) => (StatusCode::PARTIAL_CONTENT, range),
         Some(None) => {
-            let unsatisfied = [(CONTENT_RANGE, format!("bytes */{len}"))];
-            return (StatusCode::RANGE_NOT_SATISFIABLE, unsatisfied).into_response();
+            out.typed_insert(ContentRange::unsatisfied_bytes(len as u64));
+            return (StatusCode::RANGE_NOT_SATISFIABLE, out).into_response();
         }
     };
 
-    let mut response = Response::builder()
-        .status(code)
-        .header(CONTENT_TYPE, track.content_type)
-        .header(ACCEPT_RANGES, "bytes")
-        .header(CACHE_CONTROL, "no-cache")
-        .header(ETAG, &etag)
-        .header(CONTENT_LENGTH, range.len());
-
     if code == StatusCode::PARTIAL_CONTENT {
-        response = response.header(
-            CONTENT_RANGE,
-            format!("bytes {}-{}/{len}", range.start, range.end - 1),
-        );
+        let bytes = range.start as u64..range.end as u64;
+        out.typed_insert(ContentRange::bytes(bytes, len as u64).expect("range is bounded"));
     }
+    out.typed_insert(AcceptRanges::bytes());
+    out.typed_insert(CacheControl::new().with_no_cache());
+    out.typed_insert(ContentLength(range.len() as u64));
+    out.insert(CONTENT_TYPE, HeaderValue::from_static(track.content_type));
 
-    response
-        .body(Body::from(track.bytes.slice(range)))
-        .expect("headers are all valid")
+    (code, out, Body::from(track.bytes.slice(range))).into_response()
 }
 
 async fn artwork(
@@ -156,13 +147,21 @@ async fn artwork(
         .clone()
         .unwrap_or_else(|| state.default_artwork.clone());
 
-    let cache = HeaderValue::from_static("public, max-age=86400, immutable");
-    ([(CONTENT_TYPE, content_type), (CACHE_CONTROL, cache)], body).into_response()
+    let mut out = HeaderMap::new();
+    out.insert(CONTENT_TYPE, content_type);
+    out.typed_insert(
+        CacheControl::new()
+            .with_public()
+            .with_max_age(Duration::from_secs(86400))
+            .with_immutable(),
+    );
+    (out, body).into_response()
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let listen = state.broadcast.subscribe(); // subscribe before snapshotting
-    let id = session_id();
+    // 21 URL-safe characters (A-Z, a-z, 0-9, `_`, `-`) from a cryptographically secure RNG
+    let id = nanoid!();
 
     // Registered before the client learns the id, so /stream accepts it right away
     state.add_session(id.clone());
@@ -200,20 +199,13 @@ async fn serve_session(
     }
 }
 
-/// 21 random alphanumeric characters from a cryptographically secure RNG.
-fn session_id() -> String {
-    rand::rng()
-        .sample_iter(Alphanumeric)
-        .take(21)
-        .map(char::from)
-        .collect()
-}
-
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long)]
+    /// Default artwork image, for songs without a cover
+    #[arg(short, long, env = "JAMS_ARTWORK")]
     artwork: String,
-    #[arg(short, long)]
+    /// Music library folder
+    #[arg(short, long, env = "JAMS_SOURCE")]
     source: String,
 }
 
