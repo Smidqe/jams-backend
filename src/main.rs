@@ -5,52 +5,44 @@ mod song;
 mod state;
 
 use std::{
-    ops::Range,
+    ops::{Bound, Range},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{
-        HeaderMap, HeaderValue, StatusCode,
-        header::{
-            ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
-        },
-    },
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 use clap::Parser;
-use futures::{SinkExt, StreamExt};
+use headers::{
+    AcceptRanges, CacheControl, ContentLength, ContentRange, ETag, HeaderMapExt, IfNoneMatch,
+    IfRange,
+};
 use lofty::picture::Picture;
 use nanoid::nanoid;
 use serde::Deserialize;
 use tokio::{
     select, spawn,
     sync::{broadcast, broadcast::error::RecvError, watch},
-    time::Instant,
+    task::spawn_blocking,
 };
 
-use crate::{
-    event::Event,
-    playlist::Playlist,
-    radio::Radio,
-    song::image_content_type,
-    state::{AppState, CurrentSong},
-};
+use crate::{event::Event, playlist::Playlist, radio::Radio, song::Image, state::AppState};
 
-fn load_default_artwork(path: &Path) -> (Bytes, HeaderValue) {
+fn load_default_artwork(path: &Path) -> Image {
     let bytes = std::fs::read(path).expect("can't function without default artwork");
     let picture = Picture::from_reader(&mut bytes.as_slice())
         .expect("default artwork must be a PNG, JPEG, TIFF, BMP or GIF");
-    (Bytes::from(bytes), image_content_type(picture.mime_type()))
+    song::image(&picture)
 }
 
 #[derive(Deserialize)]
@@ -68,16 +60,21 @@ async fn version() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, [("x-jams-version", "0.1")])
 }
 
-/// TODO: This only considers first range, if multi range is given rest are ignored, probably not an issue though
-fn parse_range(header: &HeaderValue, len: usize) -> Option<Range<usize>> {
-    let v = http_range_header::parse_range_header(header.to_str().ok()?)
-        .ok()?
-        .validate(len as u64)
-        .ok()?;
-    let range = v.first()?;
-
-    //bytes is always +1 to end
-    Some(*range.start() as usize..*range.end() as usize + 1)
+/// The first range of a `Range` header within a file of `len` bytes, or `None` if
+/// it can't be satisfied. Only the first is used; audio players ask for one at a time.
+/// `headers` doesn't check ranges against the length, so that's done here: an end
+/// past the file means "to the end", a start past it can't be served.
+fn first_range(header: &headers::Range, len: usize) -> Option<Range<usize>> {
+    let (start, end) = header.satisfiable_ranges(len as u64).next()?;
+    let start = match start {
+        Bound::Included(s) => s as usize,
+        _ => 0,
+    };
+    let end = match end {
+        Bound::Included(e) => (e as usize).saturating_add(1).min(len),
+        _ => len,
+    };
+    (start < end).then_some(start..end)
 }
 
 async fn stream(
@@ -85,136 +82,130 @@ async fn stream(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SongQuery>,
 ) -> Response {
-    if !state.sessions.contains_sync(&query.sid) {
+    if !state.has_session(&query.sid) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let now = state.current.load_full();
-
-    if !now.is_current(&query.id) {
+    let Some(now) = state.current_if(&query.id) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     let track = &now.track;
     let len = track.bytes.len();
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(track.content_type));
-    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // The length changes the tag too, in case a file is ever replaced in place
+    let etag: ETag = format!("\"{}-{len}\"", track.id)
+        .parse()
+        .expect("ids are hex, so the tag is valid");
+    let mut out = HeaderMap::new();
+    out.typed_insert(etag.clone());
 
-    let (code, body) = match headers.get(RANGE) {
-        None => (StatusCode::OK, track.bytes.clone()),
-        Some(range_header) => match parse_range(range_header, len) {
-            Some(range) => {
-                response_headers.insert(
-                    CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", range.start, range.end - 1, len)
-                        .parse()
-                        .unwrap(),
-                );
-                (StatusCode::PARTIAL_CONTENT, track.bytes.slice(range))
-            }
-            None => {
-                response_headers.insert(CONTENT_RANGE, format!("bytes */{len}").parse().unwrap());
-                return (StatusCode::RANGE_NOT_SATISFIABLE, response_headers).into_response();
-            }
-        },
+    let not_modified = headers.typed_get::<IfNoneMatch>();
+    if not_modified.is_some_and(|h| !h.precondition_passes(&etag)) {
+        return (StatusCode::NOT_MODIFIED, out).into_response();
+    }
+
+    // A range of an older version of the file isn't a range of this one
+    let range = match headers.typed_get::<IfRange>() {
+        Some(if_range) if if_range.is_modified(Some(&etag), None) => None,
+        _ => headers.typed_get::<headers::Range>(),
     };
-    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
-    (code, response_headers, Body::from(body)).into_response()
+
+    // No Range header means the whole file; an unsatisfiable one is answered right away
+    let (code, range) = match range.map(|r| first_range(&r, len)) {
+        None => (StatusCode::OK, 0..len),
+        Some(Some(range)) => (StatusCode::PARTIAL_CONTENT, range),
+        Some(None) => {
+            out.typed_insert(ContentRange::unsatisfied_bytes(len as u64));
+            return (StatusCode::RANGE_NOT_SATISFIABLE, out).into_response();
+        }
+    };
+
+    if code == StatusCode::PARTIAL_CONTENT {
+        let bytes = range.start as u64..range.end as u64;
+        out.typed_insert(ContentRange::bytes(bytes, len as u64).expect("range is bounded"));
+    }
+    out.typed_insert(AcceptRanges::bytes());
+    out.typed_insert(CacheControl::new().with_no_cache());
+    out.typed_insert(ContentLength(range.len() as u64));
+    out.insert(CONTENT_TYPE, HeaderValue::from_static(track.content_type));
+
+    (code, out, Body::from(track.bytes.slice(range))).into_response()
 }
 
 async fn artwork(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ArtworkQuery>,
 ) -> Response {
-    let now = state.current.load();
-    if !now.is_current(&query.id) {
+    let Some(now) = state.current_if(&query.id) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    let track = &now.track;
-    let (body, content_type) = if track.art.is_empty() {
-        state.default_artwork.clone()
-    } else {
-        (track.art.clone(), track.art_type.clone())
     };
 
-    (
-        [
-            (CONTENT_TYPE, content_type),
-            (
-                CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, immutable"),
-            ),
-        ],
-        body,
-    )
-        .into_response()
-}
+    let (body, content_type) = now
+        .track
+        .art
+        .clone()
+        .unwrap_or_else(|| state.default_artwork.clone());
 
-async fn ws_upgrader(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(|s| ws_handler(s, st))
+    let mut out = HeaderMap::new();
+    out.insert(CONTENT_TYPE, content_type);
+    out.typed_insert(
+        CacheControl::new()
+            .with_public()
+            .with_max_age(Duration::from_secs(86400))
+            .with_immutable(),
+    );
+    (out, body).into_response()
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
-    let mut listen = state.broadcast.subscribe();
+    let listen = state.broadcast.subscribe(); // subscribe before snapshotting
+    // 21 URL-safe characters (A-Z, a-z, 0-9, `_`, `-`) from a cryptographically secure RNG
     let id = nanoid!();
 
-    let events = vec![
-        Event::SessionId(&id).into(),
-        Event::song(&state.current.load()).into(),
-    ];
+    // Registered before the client learns the id, so /stream accepts it right away
+    state.add_session(id.clone());
+    // Every way out of the session (closed, error, server shutdown) ends here
+    let _ = serve_session(&mut socket, &state, &id, listen).await;
+    state.remove_session(&id);
+}
 
-    for ev in events {
-        if socket.send(ev).await.is_err() {
-            return;
-        }
-    }
+async fn serve_session(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &str,
+    mut listen: broadcast::Receiver<Message>,
+) -> Result<(), axum::Error> {
+    socket.send(Event::SessionId(id).into()).await?;
+    socket
+        .send(Event::song(&state.current.load()).into())
+        .await?;
 
-    let _ = state.sessions.insert_async(id.clone()).await;
-
-    let (mut tx, mut rx) = socket.split();
-    let st2 = state.clone();
-
-    let mut sending = spawn(async move {
-        loop {
-            let msgs = match listen.recv().await {
-                Ok(m) => vec![m],
+    loop {
+        let msg = select! {
+            received = listen.recv() => match received {
+                Ok(msg) => msg,
                 // fell behind: resend a full snapshot instead of dropping the session
-                Err(RecvError::Lagged(_)) => vec![Event::song(&st2.current.load()).into()],
-                Err(_) => return,
-            };
+                Err(RecvError::Lagged(_)) => Event::song(&state.current.load()).into(),
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            incoming = socket.recv() => match incoming.transpose()? {
+                Some(Message::Close(_)) | None => return Ok(()),
+                Some(_) => continue, // clients don't send anything meaningful
+            },
+        };
 
-            for m in msgs {
-                if tx.send(m).await.is_err() {
-                    return;
-                }
-            }
-        }
-    });
-
-    let mut receiving = spawn(async move {
-        while let Some(Ok(msg)) = rx.next().await {
-            if matches!(msg, Message::Close(_)) {
-                break;
-            }
-        }
-    });
-
-    select! {
-        _ = &mut sending => receiving.abort(),
-        _ = &mut receiving => sending.abort(),
+        socket.send(msg).await?;
     }
-
-    state.sessions.remove_async(&id).await;
 }
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long)]
+    /// Default artwork image, for songs without a cover
+    #[arg(short, long, env = "JAMS_ARTWORK")]
     artwork: String,
-    #[arg(short, long)]
+    /// Music library folder
+    #[arg(short, long, env = "JAMS_SOURCE")]
     source: String,
 }
 
@@ -222,42 +213,50 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let root = PathBuf::from(&args.source);
-    let playlist = tokio::task::spawn_blocking(move || Playlist::scan(&root))
-        .await
-        .unwrap();
-    let first = song::load(&playlist.get_at_cursor())
-        .map(Arc::new)
-        .expect("can't load first track");
+    let (playlist, now) = spawn_blocking(move || {
+        let playlist = Playlist::scan(&root);
+        let now = radio::first(&playlist).expect("can't load first track");
+        (playlist, Arc::new(now))
+    })
+    .await
+    .expect("startup panicked");
 
-    let started = Instant::now();
     let (tx, _) = broadcast::channel(64);
-    let state = Arc::new(AppState {
-        current: ArcSwap::from_pointee(CurrentSong {
-            track: first.clone(),
-            started,
-        }),
-        broadcast: tx,
-        sessions: scc::HashSet::new(),
-        default_artwork: load_default_artwork(Path::new(&args.artwork)),
-    });
+    let default_artwork = load_default_artwork(Path::new(&args.artwork));
+    let state = Arc::new(AppState::new(now.clone(), tx, default_artwork));
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let radio = spawn(Radio::new(playlist, first, started, state.clone()).run(stop_rx));
+    let radio = Radio {
+        playlist,
+        state: state.clone(),
+        now,
+    };
+    let radio = spawn(radio.run(stop_rx));
 
     let app = Router::new()
         .route("/version", get(version))
         .route("/stream", get(stream))
-        .route("/ws", any(ws_upgrader))
+        .route(
+            "/ws",
+            any(
+                |ws: WebSocketUpgrade, State(state): State<Arc<AppState>>| async move {
+                    ws.on_upgrade(|socket| ws_handler(socket, state))
+                },
+            ),
+        )
         .route("/artwork", get(artwork))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9000")
+        .await
+        .expect("can't listen on 0.0.0.0:9000, is the port in use?");
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .unwrap();
+        .expect("server failed");
 
     let _ = stop_tx.send(true);
     let _ = radio.await;
